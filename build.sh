@@ -20,6 +20,8 @@ fi
 # change pwd
 cd $SCRIPT_DIR
 
+LITESTREAM_VERSION=`git rev-parse HEAD`
+
 CGO_ENABLED=1 go build \
 -v -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}'" \
 -o dist/litestream ./cmd/litestream
