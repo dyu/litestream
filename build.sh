@@ -1,6 +1,6 @@
 #!/bin/sh
 
-#set -e
+set -e
 
 CURRENT_DIR=$PWD
 # locate
@@ -22,6 +22,13 @@ cd $SCRIPT_DIR
 
 LITESTREAM_VERSION=`git rev-parse HEAD`
 
+build_bin() {
+NAME=`basename $1`
 CGO_ENABLED=1 go build \
 -v -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}'" \
--o dist/litestream ./cmd/litestream
+-o dist/$NAME $1
+}
+
+build_bin ./cmd/litestream
+build_bin ./_examples/library/basic
+build_bin ./_examples/library/s3
