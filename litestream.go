@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path"
@@ -12,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mattn/go-sqlite3"
 	"github.com/superfly/ltx"
+	_ "modernc.org/sqlite"
 )
 
 // Naming constants.
@@ -35,7 +34,7 @@ var (
 	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
 )
 
-// SQLite WAL constants
+// SQLite WAL constants.
 const (
 	WALHeaderChecksumOffset      = 24
 	WALFrameHeaderChecksumOffset = 16
@@ -48,17 +47,6 @@ var (
 	// LogFlags are the flags passed to log.New().
 	LogFlags = 0
 )
-
-func init() {
-	sql.Register("litestream-sqlite3", &sqlite3.SQLiteDriver{
-		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-			if err := conn.SetFileControlInt("main", sqlite3.SQLITE_FCNTL_PERSIST_WAL, 1); err != nil {
-				return fmt.Errorf("cannot set file control: %w", err)
-			}
-			return nil
-		},
-	})
-}
 
 // Checksum computes a running SQLite checksum over a byte slice.
 func Checksum(bo binary.ByteOrder, s0, s1 uint32, b []byte) (uint32, uint32) {
@@ -122,23 +110,25 @@ func readWALFileAt(filename string, offset, n int64) ([]byte, error) {
 // removeTmpFiles recursively finds and removes .tmp files.
 func removeTmpFiles(root string) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+		switch {
+		case err != nil:
 			return nil // skip errored files
-		} else if info.IsDir() {
+		case info.IsDir():
 			return nil // skip directories
-		} else if !strings.HasSuffix(path, ".tmp") {
+		case !strings.HasSuffix(path, ".tmp"):
 			return nil // skip non-temp files
+		default:
+			return os.Remove(path)
 		}
-		return os.Remove(path)
 	})
 }
 
-// LTXDir returns the path to an LTX directory
+// LTXDir returns the path to an LTX directory.
 func LTXDir(root string) string {
 	return path.Join(root, "ltx")
 }
 
-// LTXLevelDir returns the path to an LTX level directory
+// LTXLevelDir returns the path to an LTX level directory.
 func LTXLevelDir(root string, level int) string {
 	return path.Join(LTXDir(root), strconv.Itoa(level))
 }

@@ -26,7 +26,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs.Var((*txidVar)(&opt.TXID), "txid", "transaction ID")
 	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
-	// ifReplicaExists := fs.Bool("if-replica-exists", false, "")
+	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -46,11 +46,11 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Determine replica to restore from.
 	var r *litestream.Replica
-	if isURL(fs.Arg(0)) {
+	if litestream.IsURL(fs.Arg(0)) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
-		if r, err = c.loadFromURL(ctx, fs.Arg(0), *ifDBNotExists, &opt); err == errSkipDBExists {
+		if r, err = c.loadFromURL(ctx, fs.Arg(0), *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
 			slog.Info("database already exists, skipping")
 			return nil
 		} else if err != nil {
@@ -60,7 +60,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		if *configPath == "" {
 			*configPath = DefaultConfigPath()
 		}
-		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, &opt); err == errSkipDBExists {
+		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
 			slog.Info("database already exists, skipping")
 			return nil
 		} else if err != nil {
@@ -68,18 +68,16 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	}
 
-	/*
-		// TODO(ltx): Fix -if-replica-exists flag
-
-		// Return an error if no matching targets found.
-		// If optional flag set, return success. Useful for automated recovery.
+	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) {
 		if *ifReplicaExists {
 			slog.Info("no matching backups found")
 			return nil
 		}
-	*/
-
-	return r.Restore(ctx, opt)
+		return fmt.Errorf("no matching backup files available")
+	} else if err != nil {
+		return err
+	}
+	return nil
 }
 
 // loadFromURL creates a replica & updates the restore options from a replica URL.
@@ -88,6 +86,8 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 		return nil, fmt.Errorf("output path required")
 	}
 
+	initLog(os.Stdout, "INFO", "text")
+
 	// Exit successfully if the output file already exists.
 	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
 		return nil, errSkipDBExists
@@ -95,8 +95,10 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 
 	syncInterval := litestream.DefaultSyncInterval
 	r, err := NewReplicaFromConfig(&ReplicaConfig{
-		URL:          replicaURL,
-		SyncInterval: &syncInterval,
+		URL: replicaURL,
+		ReplicaSettings: ReplicaSettings{
+			SyncInterval: &syncInterval,
+		},
 	}, nil)
 	if err != nil {
 		return nil, err

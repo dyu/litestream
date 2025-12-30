@@ -3,6 +3,7 @@ package litestream
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -41,7 +42,7 @@ func NewWALReader(rd io.ReaderAt, logger *slog.Logger) (*WALReader, error) {
 // NewWALReaderWithOffset returns a new instance of WALReader at a given offset.
 // Salt must match or else no frames will be returned. Checksum calculated from
 // from previous page.
-func NewWALReaderWithOffset(rd io.ReaderAt, offset int64, salt1, salt2 uint32, logger *slog.Logger) (*WALReader, error) {
+func NewWALReaderWithOffset(ctx context.Context, rd io.ReaderAt, offset int64, salt1, salt2 uint32, logger *slog.Logger) (*WALReader, error) {
 	// Ensure we are not starting on the first page since we need to read the previous.
 	if offset <= WALHeaderSize {
 		return nil, fmt.Errorf("offset (%d) must be greater than the wal header size (%d)", offset, WALHeaderSize)
@@ -66,7 +67,7 @@ func NewWALReaderWithOffset(rd io.ReaderAt, offset int64, salt1, salt2 uint32, l
 
 	// Read previous page to load checksum.
 	r.frameN--
-	if _, _, err := r.readFrame(context.Background(), make([]byte, r.pageSize), false); err != nil {
+	if _, _, err := r.readFrame(ctx, make([]byte, r.pageSize), false); err != nil {
 		return nil, &PrevFrameMismatchError{Err: err}
 	}
 
@@ -194,7 +195,7 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 	data := make([]byte, r.pageSize)
 	for i := 0; ; i++ {
 		pgno, fcommit, err := r.ReadFrame(ctx, data)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		} else if err != nil {
 			return nil, 0, 0, err
@@ -211,6 +212,14 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 				m[pgno] = offset
 			}
 			commit = fcommit
+		}
+	}
+
+	// Remove pages that exceed the final commit size. This can occur when the
+	// database shrinks (e.g., via VACUUM) between transactions in the WAL.
+	for pgno := range m {
+		if pgno > commit {
+			delete(m, pgno)
 		}
 	}
 
@@ -232,6 +241,32 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 
 	r.logger.Log(ctx, internal.LevelTrace, "page map complete", "n", len(m), "end", end, "commit", commit)
 	return m, end, commit, nil
+}
+
+// FrameSaltsUntil returns a set of all unique frame salts in the WAL file.
+func (r *WALReader) FrameSaltsUntil(ctx context.Context, until [2]uint32) (map[[2]uint32]struct{}, error) {
+	m := make(map[[2]uint32]struct{})
+	for offset := int64(WALHeaderSize); ; offset += int64(WALFrameHeaderSize + r.pageSize) {
+		hdr := make([]byte, WALFrameHeaderSize)
+		if n, err := r.r.ReadAt(hdr, offset); n != len(hdr) {
+			break
+		} else if err != nil {
+			return nil, err
+		}
+
+		salt1 := binary.BigEndian.Uint32(hdr[8:])
+		salt2 := binary.BigEndian.Uint32(hdr[12:])
+
+		// Track unique salts.
+		m[[2]uint32{salt1, salt2}] = struct{}{}
+
+		// Only read salts until the last one we expect.
+		if salt1 == until[0] && salt2 == until[1] {
+			break
+		}
+	}
+
+	return m, nil
 }
 
 // WALChecksum computes a running SQLite WAL checksum over a byte slice.

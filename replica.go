@@ -2,15 +2,18 @@ package litestream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"filippo.io/age"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // Default replica settings.
@@ -27,6 +30,8 @@ type Replica struct {
 	mu  sync.RWMutex
 	pos ltx.Pos // current replicated position
 
+	syncMu sync.Mutex // protects Sync() from concurrent calls
+
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
 
@@ -42,10 +47,6 @@ type Replica struct {
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
 	MonitorEnabled bool
-
-	// Encryption identities and recipients
-	AgeIdentities []age.Identity
-	AgeRecipients []age.Recipient
 }
 
 func NewReplica(db *DB) *Replica {
@@ -118,7 +119,11 @@ func (r *Replica) Stop(hard bool) (err error) {
 }
 
 // Sync copies new WAL frames from the shadow WAL to the replica client.
+// Only one Sync can run at a time to prevent concurrent uploads of the same file.
 func (r *Replica) Sync(ctx context.Context) (err error) {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+
 	// Clear last position if if an error occurs during sync.
 	defer func() {
 		if err != nil {
@@ -149,7 +154,7 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 
 	// Replicate all L0 LTX files since last replica position.
 	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
-		if err = r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
+		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
 			return err
 		}
 		r.SetPos(ltx.Pos{TXID: txID})
@@ -188,9 +193,10 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 }
 
 // MaxLTXFileInfo returns metadata about the last LTX file for a given level.
-// Retuns nil if no files exist for the level.
+// Returns nil if no files exist for the level.
 func (r *Replica) MaxLTXFileInfo(ctx context.Context, level int) (info ltx.FileInfo, err error) {
-	itr, err := r.Client.LTXFiles(ctx, level, 0)
+	// Normal operation - use fast timestamps
+	itr, err := r.Client.LTXFiles(ctx, level, 0, false)
 	if err != nil {
 		return info, err
 	}
@@ -215,8 +221,8 @@ func (r *Replica) Pos() ltx.Pos {
 
 // SetPos sets the current replicated position.
 func (r *Replica) SetPos(pos ltx.Pos) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.pos = pos
 }
 
@@ -325,7 +331,10 @@ func (r *Replica) monitor(ctx context.Context) {
 
 		// Synchronize the shadow wal into the replication directory.
 		if err := r.Sync(ctx); err != nil {
-			r.Logger().Error("monitor error", "error", err)
+			// Don't log context cancellation errors during shutdown
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				r.Logger().Error("monitor error", "error", err)
+			}
 			continue
 		}
 	}
@@ -336,7 +345,8 @@ func (r *Replica) monitor(ctx context.Context) {
 func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
 	var min time.Time
 
-	itr, err := r.Client.LTXFiles(ctx, 0, 0)
+	// Normal operation - use fast timestamps
+	itr, err := r.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
 		return min, err
 	}
@@ -351,7 +361,8 @@ func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
 // TimeBounds returns the creation time & last updated time.
 // Returns zero time if LTX files exist.
 func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Time, err error) {
-	itr, err := r.Client.LTXFiles(ctx, 0, 0)
+	// Normal operation - use fast timestamps
+	itr, err := r.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
 		return createdAt, updatedAt, err
 	}
@@ -408,27 +419,33 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return err
 	}
 
-	infos, err := r.CalcRestorePlan(ctx, opt.TXID, opt.Timestamp)
+	infos, err := CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
 	if err != nil {
 		return fmt.Errorf("cannot calc restore plan: %w", err)
-	} else if len(infos) == 0 {
-		return fmt.Errorf("no matching backup files available")
 	}
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
 
-	var rdrs []io.Reader
+	rdrs := make([]io.Reader, 0, len(infos))
 	defer func() {
 		for _, rd := range rdrs {
-			_ = rd.(io.Closer).Close()
+			if closer, ok := rd.(io.Closer); ok {
+				_ = closer.Close()
+			}
 		}
 	}()
 
 	for _, info := range infos {
+		// Validate file size - must be at least header size to be readable
+		if info.Size < ltx.HeaderSize {
+			return fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
+				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
+		}
+
 		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 		// Add file to be compacted.
-		f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID)
+		f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 		if err != nil {
 			return fmt.Errorf("open ltx file: %w", err)
 		}
@@ -437,6 +454,15 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	if len(rdrs) == 0 {
 		return fmt.Errorf("no matching backup files available")
+	}
+
+	// Create parent directory if it doesn't exist.
+	var dirInfo os.FileInfo
+	if db := r.DB(); db != nil {
+		dirInfo = db.dirInfo
+	}
+	if err := internal.MkdirAll(filepath.Dir(opt.OutputPath), dirInfo); err != nil {
+		return fmt.Errorf("create parent directory: %w", err)
 	}
 
 	// Output to temp file & atomically rename.
@@ -452,8 +478,12 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	pr, pw := io.Pipe()
 
 	go func() {
-		c := ltx.NewCompactor(pw, rdrs)
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4
+		c, err := ltx.NewCompactor(pw, rdrs)
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			return
+		}
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
@@ -470,24 +500,22 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Copy file to final location.
 	r.Logger().Debug("renaming database from temporary location")
-	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
-		return err
-	}
-
-	return nil
+	return os.Rename(tmpOutputPath, opt.OutputPath)
 }
 
 // CalcRestorePlan returns a list of storage paths to restore a snapshot at the given TXID.
-func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID, timestamp time.Time) ([]*ltx.FileInfo, error) {
+func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, timestamp time.Time, logger *slog.Logger) ([]*ltx.FileInfo, error) {
 	if txID != 0 && !timestamp.IsZero() {
 		return nil, fmt.Errorf("cannot specify both TXID & timestamp to restore")
 	}
 
 	var infos ltx.FileInfoSlice
-	logger := r.Logger().With("target", txID)
+	logger = logger.With("target", txID)
 
 	// Start with latest snapshot before target TXID or timestamp.
-	if a, err := FindLTXFiles(ctx, r.Client, SnapshotLevel, func(info *ltx.FileInfo) (bool, error) {
+	// Pass useMetadata flag to enable accurate timestamp fetching for timestamp-based restore.
+	if a, err := FindLTXFiles(ctx, client, SnapshotLevel, !timestamp.IsZero(), func(info *ltx.FileInfo) (bool, error) {
+		logger.Debug("finding snapshot before target TXID or timestamp", "snapshot", info.MaxTXID)
 		if txID != 0 {
 			return info.MaxTXID <= txID, nil
 		} else if !timestamp.IsZero() {
@@ -506,9 +534,10 @@ func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID, timestamp 
 	// TXID granularity so the TXIDs should align between compaction levels.
 	const maxLevel = SnapshotLevel - 1
 	for level := maxLevel; level >= 0; level-- {
-		r.Logger().Debug("finding ltx files for level", "level", level)
+		logger.Debug("finding ltx files for level", "level", level)
 
-		a, err := FindLTXFiles(ctx, r.Client, level, func(info *ltx.FileInfo) (bool, error) {
+		// Pass useMetadata flag to enable accurate timestamp fetching for timestamp-based restore.
+		a, err := FindLTXFiles(ctx, client, level, !timestamp.IsZero(), func(info *ltx.FileInfo) (bool, error) {
 			if info.MaxTXID <= infos.MaxTXID() { // skip if already included in previous levels
 				return false, nil
 			}
@@ -527,6 +556,13 @@ func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID, timestamp 
 
 		// Append each storage path to the list
 		for _, info := range a {
+			// Skip if this file's range is already covered by previously added files.
+			// This can happen when a larger compacted file at the same level covers
+			// a smaller file's entire range (see issue #847).
+			if info.MaxTXID <= infos.MaxTXID() {
+				continue
+			}
+
 			// Ensure TXIDs are contiguous between each paths.
 			if !ltx.IsContiguous(infos.MaxTXID(), info.MinTXID, info.MaxTXID) {
 				return nil, fmt.Errorf("non-contiguous transaction files: prev=%s filename=%s",

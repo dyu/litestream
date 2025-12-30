@@ -1,32 +1,52 @@
 package abs
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/superfly/ltx"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 )
 
+func init() {
+	litestream.RegisterReplicaClientFactory("abs", NewReplicaClientFromURL)
+}
+
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "abs"
+
+// MetadataKeyTimestamp is the metadata key for storing LTX file timestamps in Azure Blob Storage.
+// Azure metadata keys cannot contain hyphens, so we use litestreamtimestamp (C# identifier rules).
+const MetadataKeyTimestamp = "litestreamtimestamp"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Azure Blob Storage.
 type ReplicaClient struct {
-	mu           sync.Mutex
-	containerURL *azblob.ContainerURL
+	mu     sync.Mutex
+	client *azblob.Client
+	logger *slog.Logger
 
 	// Azure credentials
 	AccountName string
@@ -40,7 +60,30 @@ type ReplicaClient struct {
 
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
-	return &ReplicaClient{}
+	return &ReplicaClient{
+		logger: slog.Default().WithGroup(ReplicaClientType),
+	}
+}
+
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+// URL format: abs://[account-name@]container/path
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
+	client := NewReplicaClient()
+
+	// Extract account name from userinfo if present (abs://account@container/path)
+	if userinfo != nil {
+		client.AccountName = userinfo.Username()
+	}
+
+	client.Bucket = host
+	client.Path = urlPath
+
+	if client.Bucket == "" {
+		return nil, fmt.Errorf("bucket required for abs replica URL")
+	}
+
+	return client, nil
 }
 
 // Type returns "abs" as the client type.
@@ -53,46 +96,92 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.containerURL != nil {
+	if c.client != nil {
 		return nil
 	}
 
-	// Read account key from environment, if available.
-	accountKey := c.AccountKey
-	if accountKey == "" {
-		accountKey = os.Getenv("LITESTREAM_AZURE_ACCOUNT_KEY")
-	}
-
-	// Authenticate to ACS.
-	credential, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
-	if err != nil {
-		return err
+	// Validate required configuration
+	if c.Bucket == "" {
+		return fmt.Errorf("abs: container name is required")
 	}
 
 	// Construct & parse endpoint unless already set.
 	endpoint := c.Endpoint
 	if endpoint == "" {
+		if c.AccountName == "" {
+			return fmt.Errorf("abs: account name is required when endpoint is not specified")
+		}
 		endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", c.AccountName)
 	}
-	endpointURL, err := url.Parse(endpoint)
-	if err != nil {
-		return fmt.Errorf("cannot parse azure endpoint: %w", err)
+
+	// Configure client options with retry policy
+	clientOptions := &azblob.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Retry: policy.RetryOptions{
+				MaxRetries:    10,
+				RetryDelay:    time.Second,
+				MaxRetryDelay: 30 * time.Second,
+				TryTimeout:    15 * time.Minute, // Reasonable timeout for blob operations
+				StatusCodes: []int{
+					http.StatusRequestTimeout,
+					http.StatusTooManyRequests,
+					http.StatusInternalServerError,
+					http.StatusBadGateway,
+					http.StatusServiceUnavailable,
+					http.StatusGatewayTimeout,
+				},
+			},
+			Telemetry: policy.TelemetryOptions{
+				ApplicationID: "litestream",
+			},
+		},
 	}
 
-	// Build pipeline and reference to container.
-	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{
-		Retry: azblob.RetryOptions{
-			TryTimeout: 24 * time.Hour,
-		},
-	})
-	containerURL := azblob.NewServiceURL(*endpointURL, pipeline).NewContainerURL(c.Bucket)
-	c.containerURL = &containerURL
+	// Check if we have explicit credentials or should use default credential chain
+	accountKey := c.AccountKey
+	if accountKey == "" {
+		accountKey = os.Getenv("LITESTREAM_AZURE_ACCOUNT_KEY")
+	}
 
+	// Create Azure Blob Storage client with appropriate authentication
+	var client *azblob.Client
+	if accountKey != "" && c.AccountName != "" {
+		// Use shared key authentication (existing behavior)
+		slog.Debug("using shared key authentication")
+		credential, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
+		if err != nil {
+			return fmt.Errorf("abs: cannot create shared key credential: %w", err)
+		}
+		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, credential, clientOptions)
+		if err != nil {
+			return fmt.Errorf("abs: cannot create azure blob client with shared key: %w", err)
+		}
+	} else {
+		// Use default credential chain (similar to AWS SDK default credential chain)
+		// This includes:
+		// - Environment variables (AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID)
+		// - Managed Identity (for Azure VMs, App Service, etc.)
+		// - Azure CLI credentials
+		// - Visual Studio Code credentials
+		slog.Debug("using default credential chain (managed identity, Azure CLI, environment variables, etc.)")
+		credential, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return fmt.Errorf("abs: cannot create default azure credential: %w", err)
+		}
+		client, err = azblob.NewClient(endpoint, credential, clientOptions)
+		if err != nil {
+			return fmt.Errorf("abs: cannot create azure blob client with default credential: %w", err)
+		}
+	}
+
+	c.client = client
 	return nil
 }
 
 // LTXFiles returns an iterator over all available LTX files.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+// Azure always uses accurate timestamps from metadata since they're included in LIST operations at zero cost.
+// The useMetadata parameter is ignored.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -106,16 +195,34 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	startTime := time.Now()
 
-	rc := internal.NewReadCounter(rd)
+	// Use TeeReader to peek at LTX header while preserving data for upload
+	var buf bytes.Buffer
+	teeReader := io.TeeReader(rd, &buf)
 
-	blobURL := c.containerURL.NewBlockBlobURL(key)
-	if _, err := azblob.UploadStreamToBlockBlob(ctx, rc, blobURL, azblob.UploadStreamToBlockBlobOptions{
-		BlobHTTPHeaders: azblob.BlobHTTPHeaders{ContentType: "application/octet-stream"},
-		BlobAccessTier:  azblob.DefaultAccessTier,
-	}); err != nil {
-		return nil, err
+	// Extract timestamp from LTX header
+	hdr, _, err := ltx.PeekHeader(teeReader)
+	if err != nil {
+		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
+
+	// Combine buffered data with rest of reader
+	rc := internal.NewReadCounter(io.MultiReader(&buf, rd))
+
+	// Upload blob with proper content type, access tier, and metadata
+	// Azure metadata keys cannot contain hyphens, so use litestreamtimestamp
+	_, err = c.client.UploadStream(ctx, c.Bucket, key, rc, &azblob.UploadStreamOptions{
+		HTTPHeaders: &blob.HTTPHeaders{
+			BlobContentType: to.Ptr("application/octet-stream"),
+		},
+		AccessTier: to.Ptr(blob.AccessTierHot), // Use Hot tier as default
+		Metadata: map[string]*string{
+			MetadataKeyTimestamp: to.Ptr(timestamp.Format(time.RFC3339Nano)),
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("abs: cannot upload ltx file %q: %w", key, err)
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
@@ -126,30 +233,35 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
 		Size:      rc.N(),
-		CreatedAt: startTime.UTC(),
+		CreatedAt: timestamp,
 	}, nil
 }
 
 // OpenLTXFile returns a reader for an LTX file.
 // Returns os.ErrNotExist if no matching min/max TXID is not found.
-func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
 	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	blobURL := c.containerURL.NewBlobURL(key)
-	resp, err := blobURL.Download(ctx, 0, 0, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
+	resp, err := c.client.DownloadStream(ctx, c.Bucket, key, &azblob.DownloadStreamOptions{
+		Range: blob.HTTPRange{
+			Offset: offset,
+			Count:  size,
+		},
+	})
+
 	if isNotExists(err) {
 		return nil, os.ErrNotExist
 	} else if err != nil {
-		return nil, fmt.Errorf("cannot start new reader for %q: %w", key, err)
+		return nil, fmt.Errorf("abs: cannot start new reader for %q: %w", key, err)
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(resp.ContentLength()))
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*resp.ContentLength))
 
-	return resp.Body(azblob.RetryReaderOptions{}), nil
+	return resp.Body, nil
 }
 
 // DeleteLTXFiles deletes LTX files.
@@ -159,12 +271,15 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 	}
 
 	for _, info := range a {
-		key := litestream.LTXFilePath(c.Path, info.Level, info.MaxTXID, info.MaxTXID)
-		blobURL := c.containerURL.NewBlobURL(key)
-		if _, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{}); isNotExists(err) {
+		key := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
+
+		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
+
+		_, err := c.client.DeleteBlob(ctx, c.Bucket, key, nil)
+		if isNotExists(err) {
 			continue
 		} else if err != nil {
-			return fmt.Errorf("cannot delete ltx file %q: %w", key, err)
+			return fmt.Errorf("abs: cannot delete ltx file %q: %w", key, err)
 		}
 
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
@@ -179,24 +294,33 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		return err
 	}
 
-	var marker azblob.Marker
-	for marker.NotDone() {
+	// List all blobs with the configured path prefix
+	prefix := "/"
+	if c.Path != "" {
+		prefix = strings.TrimSuffix(c.Path, "/") + "/"
+	}
+
+	pager := c.client.NewListBlobsFlatPager(c.Bucket, &azblob.ListBlobsFlatOptions{
+		Prefix:  &prefix,
+		Include: azblob.ListBlobsInclude{Metadata: true},
+	})
+
+	for pager.More() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := c.containerURL.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: "/"})
+		resp, err := pager.NextPage(ctx)
 		if err != nil {
-			return err
+			return fmt.Errorf("abs: cannot list blobs: %w", err)
 		}
-		marker = resp.NextMarker
 
 		for _, item := range resp.Segment.BlobItems {
 			internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
-			blobURL := c.containerURL.NewBlobURL(item.Name)
-			if _, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{}); isNotExists(err) {
+			_, err := c.client.DeleteBlob(ctx, c.Bucket, *item.Name, nil)
+			if isNotExists(err) {
 				continue
 			} else if err != nil {
-				return err
+				return fmt.Errorf("abs: cannot delete blob %q: %w", *item.Name, err)
 			}
 		}
 	}
@@ -205,120 +329,146 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 type ltxFileIterator struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 	client *ReplicaClient
 	level  int
 	seek   ltx.TXID
 
-	ch     chan ltx.FileInfo
-	g      errgroup.Group
-	ctx    context.Context
-	cancel func()
+	pager     *runtime.Pager[azblob.ListBlobsFlatResponse]
+	pageItems []*ltx.FileInfo
+	pageIndex int
 
-	info ltx.FileInfo
-	err  error
+	closed bool
+	err    error
+	info   *ltx.FileInfo
 }
 
 func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID) *ltxFileIterator {
+	ctx, cancel := context.WithCancel(ctx)
+
 	itr := &ltxFileIterator{
+		ctx:    ctx,
+		cancel: cancel,
 		client: client,
 		level:  level,
 		seek:   seek,
-		ch:     make(chan ltx.FileInfo),
 	}
 
-	itr.ctx, itr.cancel = context.WithCancel(ctx)
-	itr.g.Go(itr.fetch)
+	// Create paginator for listing blobs with level prefix
+	dir := litestream.LTXLevelDir(client.Path, level)
+	prefix := dir + "/"
+	if seek != 0 {
+		prefix += seek.String()
+	}
+
+	itr.pager = client.client.NewListBlobsFlatPager(client.Bucket, &azblob.ListBlobsFlatOptions{
+		Prefix:  &prefix,
+		Include: azblob.ListBlobsInclude{Metadata: true},
+	})
 
 	return itr
 }
 
-// fetch runs in a separate goroutine to fetch pages of objects and stream them to a channel.
-func (itr *ltxFileIterator) fetch() error {
-	defer close(itr.ch)
-
-	dir := litestream.LTXLevelDir(itr.client.Path, itr.level)
-	prefix := dir + "/"
-	if itr.seek != 0 {
-		prefix += itr.seek.String()
-	}
-
-	var marker azblob.Marker
-	for marker.NotDone() {
-		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
-
-		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
-		if err != nil {
-			return err
-		}
-		marker = resp.NextMarker
-
-		for _, item := range resp.Segment.BlobItems {
-			key := path.Base(item.Name)
-			minTXID, maxTXID, err := ltx.ParseFilename(key)
-			if err != nil {
-				continue
-			}
-
-			info := ltx.FileInfo{
-				Level:     itr.level,
-				MinTXID:   minTXID,
-				MaxTXID:   maxTXID,
-				Size:      *item.Properties.ContentLength,
-				CreatedAt: item.Properties.CreationTime.UTC(),
-			}
-
-			select {
-			case <-itr.ctx.Done():
-			case itr.ch <- info:
-			}
-		}
-	}
+func (itr *ltxFileIterator) Close() (err error) {
+	itr.closed = true
+	itr.cancel()
 	return nil
 }
 
-func (itr *ltxFileIterator) Close() (err error) {
-	err = itr.err
-
-	// Cancel context and wait for error group to finish.
-	itr.cancel()
-	if e := itr.g.Wait(); e != nil && err == nil {
-		err = e
+func (itr *ltxFileIterator) Next() bool {
+	if itr.closed || itr.err != nil {
+		return false
 	}
 
-	return err
+	// Process blobs until we find a valid LTX file
+	for {
+		// Load next page if needed
+		if itr.pageItems == nil || itr.pageIndex >= len(itr.pageItems) {
+			if !itr.loadNextPage() {
+				return false
+			}
+		}
+
+		// Process current item from page
+		if itr.pageIndex < len(itr.pageItems) {
+			itr.info = itr.pageItems[itr.pageIndex]
+			itr.pageIndex++
+			return true
+		}
+	}
 }
 
-func (itr *ltxFileIterator) Next() bool {
-	// Exit if an error has already occurred.
-	if itr.err != nil {
+// loadNextPage loads the next page of blobs and extracts valid LTX files
+func (itr *ltxFileIterator) loadNextPage() bool {
+	if !itr.pager.More() {
 		return false
 	}
 
-	// Return false if context was canceled or if there are no more segments.
-	// Otherwise fetch the next segment and store it on the iterator.
-	select {
-	case <-itr.ctx.Done():
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
+
+	resp, err := itr.pager.NextPage(itr.ctx)
+	if err != nil {
+		itr.err = fmt.Errorf("abs: cannot list blobs: %w", err)
 		return false
-	case info, ok := <-itr.ch:
-		if !ok {
-			return false
-		}
-		itr.info = info
-		return true
 	}
+
+	// Extract blob items directly from the response
+	itr.pageItems = nil
+	itr.pageIndex = 0
+
+	for _, item := range resp.Segment.BlobItems {
+		key := path.Base(*item.Name)
+		minTXID, maxTXID, err := ltx.ParseFilename(key)
+		if err != nil {
+			continue // Skip non-LTX files
+		}
+
+		// Build file info
+		info := &ltx.FileInfo{
+			Level:   itr.level,
+			MinTXID: minTXID,
+			MaxTXID: maxTXID,
+			Size:    *item.Properties.ContentLength,
+		}
+
+		// Skip if below seek TXID
+		if info.MinTXID < itr.seek {
+			continue
+		}
+
+		// Skip if wrong level
+		if info.Level != itr.level {
+			continue
+		}
+
+		// Always use accurate timestamp from metadata since it's zero-cost
+		// Azure includes metadata in LIST operations, so no extra API call needed
+		info.CreatedAt = item.Properties.CreationTime.UTC()
+		if item.Metadata != nil {
+			if ts, ok := item.Metadata[MetadataKeyTimestamp]; ok && ts != nil {
+				if parsed, err := time.Parse(time.RFC3339Nano, *ts); err == nil {
+					info.CreatedAt = parsed
+				}
+			}
+		}
+
+		itr.pageItems = append(itr.pageItems, info)
+	}
+
+	return len(itr.pageItems) > 0 || itr.pager.More()
 }
 
 func (itr *ltxFileIterator) Err() error { return itr.err }
 
 func (itr *ltxFileIterator) Item() *ltx.FileInfo {
-	return &itr.info
+	return itr.info
 }
 
 func isNotExists(err error) bool {
-	switch err := err.(type) {
-	case azblob.StorageError:
-		return err.ServiceCode() == azblob.ServiceCodeBlobNotFound
-	default:
-		return false
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.ErrorCode == string(bloberror.BlobNotFound) || respErr.ErrorCode == string(bloberror.ContainerNotFound)
 	}
+	return false
 }

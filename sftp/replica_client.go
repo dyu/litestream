@@ -1,11 +1,14 @@
 package sftp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path"
 	"sync"
@@ -18,6 +21,10 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 )
+
+func init() {
+	litestream.RegisterReplicaClientFactory("sftp", NewReplicaClientFromURL)
+}
 
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "sftp"
@@ -34,6 +41,7 @@ type ReplicaClient struct {
 	mu         sync.Mutex
 	sshClient  *ssh.Client
 	sftpClient *sftp.Client
+	logger     *slog.Logger
 
 	// SFTP connection info
 	Host        string
@@ -41,23 +49,61 @@ type ReplicaClient struct {
 	Password    string
 	Path        string
 	KeyPath     string
+	HostKey     string
 	DialTimeout time.Duration
+
+	// ConcurrentWrites enables concurrent writes for better performance.
+	// Note: This makes resuming failed transfers unsafe.
+	ConcurrentWrites bool
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
-		DialTimeout: DefaultDialTimeout,
+		logger:           slog.Default().WithGroup(ReplicaClientType),
+		DialTimeout:      DefaultDialTimeout,
+		ConcurrentWrites: true, // Default to true for better performance
 	}
 }
 
-// Type returns "gcs" as the client type.
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+// URL format: sftp://[user[:password]@]host[:port]/path
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
+	client := NewReplicaClient()
+
+	// Extract credentials from userinfo
+	if userinfo != nil {
+		client.User = userinfo.Username()
+		client.Password, _ = userinfo.Password()
+	}
+
+	client.Host = host
+	client.Path = urlPath
+
+	if client.Host == "" {
+		return nil, fmt.Errorf("host required for sftp replica URL")
+	}
+	if client.User == "" {
+		return nil, fmt.Errorf("user required for sftp replica URL")
+	}
+
+	return client, nil
+}
+
+// Type returns "sftp" as the client type.
 func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
-// Init initializes the connection to GCS. No-op if already initialized.
-func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
+// Init initializes the connection to SFTP. No-op if already initialized.
+func (c *ReplicaClient) Init(ctx context.Context) error {
+	_, err := c.init(ctx)
+	return err
+}
+
+// init initializes the connection and returns the SFTP client.
+func (c *ReplicaClient) init(ctx context.Context) (_ *sftp.Client, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -70,9 +116,20 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 	}
 
 	// Build SSH configuration & auth methods
+	var hostkey ssh.HostKeyCallback
+	if c.HostKey != "" {
+		var pubkey, _, _, _, err = ssh.ParseAuthorizedKey([]byte(c.HostKey))
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse sftp host key: %w", err)
+		}
+		hostkey = ssh.FixedHostKey(pubkey)
+	} else {
+		slog.Warn("sftp host key not verified", "host", c.Host)
+		hostkey = ssh.InsecureIgnoreHostKey()
+	}
 	config := &ssh.ClientConfig{
 		User:            c.User,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostkey,
 		BannerCallback:  ssh.BannerDisplayStderr(),
 	}
 	if c.Password != "" {
@@ -82,12 +139,12 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 	if c.KeyPath != "" {
 		buf, err := os.ReadFile(c.KeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("cannot read sftp key path: %w", err)
+			return nil, fmt.Errorf("sftp: cannot read sftp key path: %w", err)
 		}
 
 		signer, err := ssh.ParsePrivateKey(buf)
 		if err != nil {
-			return nil, fmt.Errorf("cannot parse sftp key path: %w", err)
+			return nil, fmt.Errorf("sftp: cannot parse sftp key path: %w", err)
 		}
 		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
 	}
@@ -104,7 +161,13 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 	}
 
 	// Wrap connection with an SFTP client.
-	if c.sftpClient, err = sftp.NewClient(c.sshClient); err != nil {
+	// Configure options based on client settings
+	opts := []sftp.ClientOption{}
+	if c.ConcurrentWrites {
+		opts = append(opts, sftp.UseConcurrentWrites(true))
+	}
+
+	if c.sftpClient, err = sftp.NewClient(c.sshClient, opts...); err != nil {
 		c.sshClient.Close()
 		c.sshClient = nil
 		return nil, err
@@ -117,7 +180,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return err
 	}
@@ -128,7 +191,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 		if err := walker.Err(); os.IsNotExist(err) {
 			continue
 		} else if err != nil {
-			return fmt.Errorf("cannot walk path %q: %w", walker.Path(), err)
+			return fmt.Errorf("sftp: cannot walk path %q: %w", walker.Path(), err)
 		}
 		if walker.Stat().IsDir() {
 			dirs = append(dirs, walker.Path())
@@ -136,7 +199,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 		}
 
 		if err := sftpClient.Remove(walker.Path()); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("cannot delete file %q: %w", walker.Path(), err)
+			return fmt.Errorf("sftp: cannot delete file %q: %w", walker.Path(), err)
 		}
 
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
@@ -146,7 +209,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 	for i := len(dirs) - 1; i >= 0; i-- {
 		filename := dirs[i]
 		if err := sftpClient.RemoveDirectory(filename); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("cannot delete directory %q: %w", filename, err)
+			return fmt.Errorf("sftp: cannot delete directory %q: %w", filename, err)
 		}
 	}
 
@@ -156,10 +219,12 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 }
 
 // LTXFiles returns an iterator over all available LTX files for a level.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (_ ltx.FileIterator, err error) {
+// SFTP uses file ModTime for timestamps, which is set via Chtimes() to preserve original timestamp.
+// The useMetadata parameter is ignored since ModTime always contains the accurate timestamp.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ bool) (_ ltx.FileIterator, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +252,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
 			Size:      fi.Size(),
-			CreatedAt: fi.ModTime().UTC(),
+			CreatedAt: fi.ModTime().UTC(), // ModTime contains accurate timestamp from Chtimes()
 		})
 	}
 
@@ -198,29 +263,47 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	startTime := time.Now()
+
+	// Use TeeReader to peek at LTX header while preserving data for upload
+	var buf bytes.Buffer
+	teeReader := io.TeeReader(rd, &buf)
+
+	// Extract timestamp from LTX header
+	hdr, _, err := ltx.PeekHeader(teeReader)
+	if err != nil {
+		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
+
+	// Combine buffered data with rest of reader
+	fullReader := io.MultiReader(&buf, rd)
 
 	if err := sftpClient.MkdirAll(path.Dir(filename)); err != nil {
-		return nil, fmt.Errorf("cannot make parent snapshot directory %q: %w", path.Dir(filename), err)
+		return nil, fmt.Errorf("sftp: cannot make parent snapshot directory %q: %w", path.Dir(filename), err)
 	}
 
 	f, err := sftpClient.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open snapshot file for writing: %w", err)
+		return nil, fmt.Errorf("sftp: cannot open snapshot file for writing: %w", err)
 	}
 	defer f.Close()
 
-	n, err := io.Copy(f, rd)
+	n, err := io.Copy(f, fullReader)
 	if err != nil {
 		return nil, err
 	} else if err := f.Close(); err != nil {
 		return nil, err
+	}
+
+	// Set file ModTime to preserve original timestamp
+	if err := sftpClient.Chtimes(filename, timestamp, timestamp); err != nil {
+		return nil, fmt.Errorf("sftp: cannot set file timestamps: %w", err)
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
@@ -231,28 +314,37 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
 		Size:      n,
-		CreatedAt: startTime.UTC(),
+		CreatedAt: timestamp,
 	}, nil
 }
 
 // OpenLTXFile returns a reader for an LTX file.
 // Returns os.ErrNotExist if no matching position is found.
-func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (_ io.ReadCloser, err error) {
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (_ io.ReadCloser, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	f, err := sftpClient.Open(filename)
+	f, err := sftpClient.OpenFile(filename, os.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}
 
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return nil, err
+		}
+	}
+
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
 
+	if size > 0 {
+		return internal.LimitReadCloser(f, size), nil
+	}
 	return f, nil
 }
 
@@ -260,15 +352,18 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return err
 	}
 
 	for _, info := range a {
 		filename := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
+
+		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", filename)
+
 		if err := sftpClient.Remove(filename); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("cannot delete ltx file %q: %w", filename, err)
+			return fmt.Errorf("sftp: cannot delete ltx file %q: %w", filename, err)
 		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
@@ -280,13 +375,13 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 func (c *ReplicaClient) Cleanup(ctx context.Context) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return err
 	}
 
 	if err := sftpClient.RemoveDirectory(c.Path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("cannot delete path: %w", err)
+		return fmt.Errorf("sftp: cannot delete path: %w", err)
 	}
 	return nil
 }

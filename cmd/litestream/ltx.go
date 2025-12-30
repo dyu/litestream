@@ -28,13 +28,14 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	var r *litestream.Replica
-	if isURL(fs.Arg(0)) {
+	if litestream.IsURL(fs.Arg(0)) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
 		if r, err = NewReplicaFromConfig(&ReplicaConfig{URL: fs.Arg(0)}, nil); err != nil {
 			return err
 		}
+		initLog(os.Stdout, "INFO", "text")
 	} else {
 		if *configPath == "" {
 			*configPath = DefaultConfigPath()
@@ -70,7 +71,8 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 	defer w.Flush()
 
 	fmt.Fprintln(w, "min_txid\tmax_txid\tsize\tcreated")
-	itr, err := r.Client.LTXFiles(ctx, 0, 0)
+	// Normal operation - use fast timestamps
+	itr, err := r.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
 		return err
 	}
@@ -79,7 +81,7 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 	for itr.Next() {
 		info := itr.Item()
 
-		fmt.Fprintf(w, "%x\t%d\t%d\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\n",
 			info.MinTXID,
 			info.MaxTXID,
 			info.Size,

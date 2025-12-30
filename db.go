@@ -14,27 +14,48 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
+	"modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
 )
 
 // Default DB settings.
 const (
-	DefaultMonitorInterval    = 1 * time.Second
-	DefaultCheckpointInterval = 1 * time.Minute
-	DefaultBusyTimeout        = 1 * time.Second
-	DefaultMinCheckpointPageN = 1000
-	DefaultMaxCheckpointPageN = 10000
-	DefaultTruncatePageN      = 500000
+	DefaultMonitorInterval      = 1 * time.Second
+	DefaultCheckpointInterval   = 1 * time.Minute
+	DefaultBusyTimeout          = 1 * time.Second
+	DefaultMinCheckpointPageN   = 1000
+	DefaultTruncatePageN        = 121359 // ~500MB with 4KB page size
+	DefaultShutdownSyncTimeout  = 30 * time.Second
+	DefaultShutdownSyncInterval = 500 * time.Millisecond
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
+//
+// Checkpoint Strategy:
+// Litestream uses a progressive 3-tier checkpoint approach to balance WAL size
+// management with write availability:
+//
+//  1. MinCheckpointPageN (PASSIVE): Non-blocking checkpoint at ~1k pages (~4MB).
+//     Attempts checkpoint but allows concurrent readers/writers.
+//
+//  2. CheckpointInterval (PASSIVE): Time-based non-blocking checkpoint.
+//     Ensures regular checkpointing even with low write volume.
+//
+//  3. TruncatePageN (TRUNCATE): Blocking checkpoint at ~121k pages (~500MB).
+//     Emergency brake for runaway WAL growth. Can block writes while waiting
+//     for long-lived read transactions. Configurable/disableable.
+//
+// The RESTART checkpoint mode was permanently removed due to production issues
+// with indefinite write blocking (issue #724). All checkpoints now use either
+// PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
 	mu       sync.RWMutex
 	path     string        // part to database
@@ -45,6 +66,12 @@ type DB struct {
 	pageSize int           // page size, in bytes
 	notify   chan struct{} // closes on WAL change
 	chkMu    sync.RWMutex  // checkpoint lock
+
+	// syncedSinceCheckpoint tracks whether any data has been synced since
+	// the last checkpoint. Used to prevent time-based checkpoints from
+	// triggering when there are no actual database changes, which would
+	// otherwise create unnecessary LTX files. See issue #896.
+	syncedSinceCheckpoint bool
 
 	// last file info for each level
 	maxLTXFileInfos struct {
@@ -74,29 +101,28 @@ type DB struct {
 	// Minimum threshold of WAL size, in pages, before a passive checkpoint.
 	// A passive checkpoint will attempt a checkpoint but fail if there are
 	// active transactions occurring at the same time.
-	MinCheckpointPageN int
-
-	// Maximum threshold of WAL size, in pages, before a forced checkpoint.
-	// A forced checkpoint will block new transactions and wait for existing
-	// transactions to finish before issuing a checkpoint and resetting the WAL.
 	//
-	// If zero, no checkpoints are forced. This can cause the WAL to grow
-	// unbounded if there are always read transactions occurring.
-	MaxCheckpointPageN int
+	// Uses PASSIVE checkpoint mode (non-blocking). Keeps WAL size manageable
+	// for faster restores. Default: 1000 pages (~4MB with 4KB page size).
+	MinCheckpointPageN int
 
 	// Threshold of WAL size, in pages, before a forced truncation checkpoint.
 	// A forced truncation checkpoint will block new transactions and wait for
 	// existing transactions to finish before issuing a checkpoint and
 	// truncating the WAL.
 	//
-	// If zero, no truncates are forced. This can cause the WAL to grow
-	// unbounded if there's a sudden spike of changes between other
-	// checkpoints.
+	// Uses TRUNCATE checkpoint mode (blocking). Prevents unbounded WAL growth
+	// from long-lived read transactions. Default: 121359 pages (~500MB with 4KB
+	// page size). Set to 0 to disable forced truncation (use with caution as
+	// WAL can grow unbounded if read transactions prevent checkpointing).
 	TruncatePageN int
 
 	// Time between automatic checkpoints in the WAL. This is done to allow
 	// more fine-grained WAL files so that restores can be performed with
 	// better precision.
+	//
+	// Uses PASSIVE checkpoint mode (non-blocking). Default: 1 minute.
+	// Set to 0 to disable time-based checkpoints.
 	CheckpointInterval time.Duration
 
 	// Frequency at which to perform db sync.
@@ -105,9 +131,18 @@ type DB struct {
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
 
+	// Minimum time to retain L0 files after they have been compacted into L1.
+	L0Retention time.Duration
+
 	// Remote replica for the database.
 	// Must be set before calling Open().
 	Replica *Replica
+
+	// Shutdown sync retry settings.
+	// ShutdownSyncTimeout is the total time to retry syncing on shutdown.
+	// ShutdownSyncInterval is the time between retry attempts.
+	ShutdownSyncTimeout  time.Duration
+	ShutdownSyncInterval time.Duration
 
 	// Where to send log messages, defaults to global slog with database epath.
 	Logger *slog.Logger
@@ -122,13 +157,15 @@ func NewDB(path string) *DB {
 		metaPath: filepath.Join(dir, "."+file+MetaDirSuffix),
 		notify:   make(chan struct{}),
 
-		MinCheckpointPageN: DefaultMinCheckpointPageN,
-		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
-		TruncatePageN:      DefaultTruncatePageN,
-		CheckpointInterval: DefaultCheckpointInterval,
-		MonitorInterval:    DefaultMonitorInterval,
-		BusyTimeout:        DefaultBusyTimeout,
-		Logger:             slog.With("db", filepath.Base(path)),
+		MinCheckpointPageN:   DefaultMinCheckpointPageN,
+		TruncatePageN:        DefaultTruncatePageN,
+		CheckpointInterval:   DefaultCheckpointInterval,
+		MonitorInterval:      DefaultMonitorInterval,
+		BusyTimeout:          DefaultBusyTimeout,
+		L0Retention:          DefaultL0Retention,
+		ShutdownSyncTimeout:  DefaultShutdownSyncTimeout,
+		ShutdownSyncInterval: DefaultShutdownSyncInterval,
+		Logger:               slog.With("db", filepath.Base(path)),
 	}
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 
@@ -295,7 +332,7 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	// Ensure replicas perform a final sync and stop replicating.
 	if db.Replica != nil {
 		if db.db != nil {
-			if e := db.Replica.Sync(ctx); e != nil && err == nil {
+			if e := db.syncReplicaWithRetry(ctx); e != nil && err == nil {
 				err = e
 			}
 		}
@@ -324,9 +361,104 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	return err
 }
 
+// syncReplicaWithRetry attempts to sync the replica with retry logic for shutdown.
+// It retries until success, timeout, or context cancellation.
+// If ShutdownSyncTimeout is 0, it performs a single sync attempt without retries.
+func (db *DB) syncReplicaWithRetry(ctx context.Context) error {
+	if db.Replica == nil {
+		return nil
+	}
+
+	timeout := db.ShutdownSyncTimeout
+	interval := db.ShutdownSyncInterval
+
+	// If timeout is zero, just try once (no retry)
+	if timeout == 0 {
+		return db.Replica.Sync(ctx)
+	}
+
+	// Use default interval if not set
+	if interval == 0 {
+		interval = DefaultShutdownSyncInterval
+	}
+
+	// Create deadline context for total retry duration
+	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lastErr error
+	attempt := 0
+	startTime := time.Now()
+
+	for {
+		attempt++
+
+		// Try sync
+		if err := db.Replica.Sync(deadlineCtx); err == nil {
+			if attempt > 1 {
+				db.Logger.Info("shutdown sync succeeded after retry",
+					"attempts", attempt,
+					"duration", time.Since(startTime))
+			}
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		// Check if we should stop retrying
+		select {
+		case <-deadlineCtx.Done():
+			db.Logger.Error("shutdown sync failed after timeout",
+				"attempts", attempt,
+				"duration", time.Since(startTime),
+				"lastError", lastErr)
+			return fmt.Errorf("shutdown sync timeout after %d attempts: %w", attempt, lastErr)
+		default:
+		}
+
+		// Log retry
+		db.Logger.Warn("shutdown sync failed, retrying",
+			"attempt", attempt,
+			"error", lastErr,
+			"elapsed", time.Since(startTime),
+			"remaining", time.Until(startTime.Add(timeout)))
+
+		// Wait before retry
+		select {
+		case <-time.After(interval):
+		case <-deadlineCtx.Done():
+			return fmt.Errorf("shutdown sync timeout after %d attempts: %w", attempt, lastErr)
+		}
+	}
+}
+
+// setPersistWAL sets the PERSIST_WAL file control on the database connection.
+// This prevents SQLite from removing the WAL file when connections close.
+func (db *DB) setPersistWAL(ctx context.Context) error {
+	conn, err := db.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("get connection: %w", err)
+	}
+	defer conn.Close()
+
+	return conn.Raw(func(driverConn interface{}) error {
+		fc, ok := driverConn.(sqlite.FileControl)
+		if !ok {
+			return fmt.Errorf("driver does not implement FileControl")
+		}
+
+		_, err := fc.FileControlPersistWAL("main", 1)
+		if err != nil {
+			return fmt.Errorf("FileControlPersistWAL: %w", err)
+		}
+
+		return nil
+	})
+}
+
 // init initializes the connection to the database.
 // Skipped if already initialized or if the database file does not exist.
-func (db *DB) init() (err error) {
+func (db *DB) init(ctx context.Context) (err error) {
 	// Exit if already initialized.
 	if db.db != nil {
 		return nil
@@ -347,13 +479,16 @@ func (db *DB) init() (err error) {
 	}
 	db.dirInfo = fi
 
-	dsn := db.path
-	dsn += fmt.Sprintf("?_busy_timeout=%d", db.BusyTimeout.Milliseconds())
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)",
+		db.path, db.BusyTimeout.Milliseconds())
 
-	// Connect to SQLite database. Use the driver registered with a hook to
-	// prevent WAL files from being removed.
-	if db.db, err = sql.Open("litestream-sqlite3", dsn); err != nil {
+	if db.db, err = sql.Open("sqlite", dsn); err != nil {
 		return err
+	}
+
+	// Set PERSIST_WAL to prevent WAL file removal when database connections close.
+	if err := db.setPersistWAL(ctx); err != nil {
+		return fmt.Errorf("set PERSIST_WAL: %w", err)
 	}
 
 	// Open long-running database file descriptor. Required for non-OFD locks.
@@ -375,37 +510,37 @@ func (db *DB) init() (err error) {
 	// Enable WAL and ensure it is set. New mode should be returned on success:
 	// https://www.sqlite.org/pragma.html#pragma_journal_mode
 	var mode string
-	if err := db.db.QueryRow(`PRAGMA journal_mode = wal;`).Scan(&mode); err != nil {
+	if err := db.db.QueryRowContext(ctx, `PRAGMA journal_mode = wal;`).Scan(&mode); err != nil {
 		return err
 	} else if mode != "wal" {
 		return fmt.Errorf("enable wal failed, mode=%q", mode)
 	}
 
 	// Disable autocheckpoint for litestream's connection.
-	if _, err := db.db.ExecContext(db.ctx, `PRAGMA wal_autocheckpoint = 0;`); err != nil {
+	if _, err := db.db.ExecContext(ctx, `PRAGMA wal_autocheckpoint = 0;`); err != nil {
 		return fmt.Errorf("disable autocheckpoint: %w", err)
 	}
 
 	// Create a table to force writes to the WAL when empty.
 	// There should only ever be one row with id=1.
-	if _, err := db.db.Exec(`CREATE TABLE IF NOT EXISTS _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER);`); err != nil {
+	if _, err := db.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER);`); err != nil {
 		return fmt.Errorf("create _litestream_seq table: %w", err)
 	}
 
 	// Create a lock table to force write locks during sync.
 	// The sync write transaction always rolls back so no data should be in this table.
-	if _, err := db.db.Exec(`CREATE TABLE IF NOT EXISTS _litestream_lock (id INTEGER);`); err != nil {
+	if _, err := db.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _litestream_lock (id INTEGER);`); err != nil {
 		return fmt.Errorf("create _litestream_lock table: %w", err)
 	}
 
 	// Start a long-running read transaction to prevent other transactions
 	// from checkpointing.
-	if err := db.acquireReadLock(); err != nil {
+	if err := db.acquireReadLock(ctx); err != nil {
 		return fmt.Errorf("acquire read lock: %w", err)
 	}
 
 	// Read page size.
-	if err := db.db.QueryRow(`PRAGMA page_size;`).Scan(&db.pageSize); err != nil {
+	if err := db.db.QueryRowContext(ctx, `PRAGMA page_size;`).Scan(&db.pageSize); err != nil {
 		return fmt.Errorf("read page size: %w", err)
 	} else if db.pageSize <= 0 {
 		return fmt.Errorf("invalid db page size: %d", db.pageSize)
@@ -417,14 +552,22 @@ func (db *DB) init() (err error) {
 	}
 
 	// Ensure WAL has at least one frame in it.
-	if err := db.ensureWALExists(); err != nil {
+	if err := db.ensureWALExists(ctx); err != nil {
 		return fmt.Errorf("ensure wal exists: %w", err)
 	}
 
+	// Check if database is behind replica (issue #781).
+	// This must happen before replica.Start() to detect restore scenarios.
+	if db.Replica != nil {
+		if err := db.checkDatabaseBehindReplica(ctx); err != nil {
+			return fmt.Errorf("check database behind replica: %w", err)
+		}
+	}
+
 	// If we have an existing replication files, ensure the headers match.
-	//if err := db.verifyHeadersMatch(); err != nil {
-	//	return fmt.Errorf("cannot determine last wal position: %w", err)
-	//}
+	// if err := db.verifyHeadersMatch(); err != nil {
+	// 	return fmt.Errorf("cannot determine last wal position: %w", err)
+	// }
 
 	// TODO(gen): Generate diff of current LTX snapshot and save as next LTX file.
 
@@ -479,19 +622,19 @@ func (db *DB) verifyHeadersMatch() error {
 */
 
 // acquireReadLock begins a read transaction on the database to prevent checkpointing.
-func (db *DB) acquireReadLock() error {
+func (db *DB) acquireReadLock(ctx context.Context) error {
 	if db.rtx != nil {
 		return nil
 	}
 
 	// Start long running read-transaction to prevent checkpoints.
-	tx, err := db.db.Begin()
+	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 
 	// Execute read query to obtain read lock.
-	if _, err := tx.ExecContext(db.ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
+	if _, err := tx.ExecContext(ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -520,7 +663,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	defer db.mu.Unlock()
 
 	// Initialize database, if necessary. Exit if no DB exists.
-	if err := db.init(); err != nil {
+	if err := db.init(ctx); err != nil {
 		return err
 	} else if db.db == nil {
 		db.Logger.Debug("sync: no database found")
@@ -538,40 +681,23 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	}()
 
 	// Ensure WAL has at least one frame in it.
-	if err := db.ensureWALExists(); err != nil {
+	if err := db.ensureWALExists(ctx); err != nil {
 		return fmt.Errorf("ensure wal exists: %w", err)
 	}
 
-	if err := db.verifyAndSync(ctx, false); err != nil {
+	origWALSize, newWALSize, synced, err := db.verifyAndSync(ctx, false)
+	if err != nil {
 		return err
 	}
 
-	/*
-		// TODO(ltx): Move checkpointing into its own goroutine?
+	// Track that data was synced for time-based checkpoint decisions.
+	if synced {
+		db.syncedSinceCheckpoint = true
+	}
 
-		// If WAL size is greater than max threshold, force checkpoint.
-		// If WAL size is greater than min threshold, attempt checkpoint.
-		var checkpoint bool
-		checkpointMode := CheckpointModePassive
-		if db.TruncatePageN > 0 && origWALSize >= calcWALSize(db.pageSize, db.TruncatePageN) {
-			checkpoint, checkpointMode = true, CheckpointModeTruncate
-		} else if db.MaxCheckpointPageN > 0 && newWALSize >= calcWALSize(db.pageSize, db.MaxCheckpointPageN) {
-			checkpoint, checkpointMode = true, CheckpointModeRestart
-		} else if newWALSize >= calcWALSize(db.pageSize, db.MinCheckpointPageN) {
-			checkpoint = true
-		} else if db.CheckpointInterval > 0 && !info.dbModTime.IsZero() && time.Since(info.dbModTime) > db.CheckpointInterval && newWALSize > calcWALSize(db.pageSize, 1) {
-			checkpoint = true
-		}
-
-		// Issue the checkpoint.
-		if checkpoint {
-			changed = true
-
-			if err := db.checkpoint(ctx, checkpointMode); err != nil {
-				return fmt.Errorf("checkpoint: mode=%v err=%w", checkpointMode, err)
-			}
-		}
-	*/
+	if err := db.checkpointIfNeeded(ctx, origWALSize, newWALSize); err != nil {
+		return fmt.Errorf("checkpoint: %w", err)
+	}
 
 	// Compute current index and total shadow WAL size.
 	pos, err := db.Pos()
@@ -579,7 +705,12 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		return fmt.Errorf("pos: %w", err)
 	}
 	db.txIDGauge.Set(float64(pos.TXID))
-	// db.shadowWALSizeGauge.Set(float64(size))
+
+	// Update file size metrics.
+	if fi, err := os.Stat(db.path); err == nil {
+		db.dbSizeGauge.Set(float64(fi.Size()))
+	}
+	db.walSizeGauge.Set(float64(newWALSize))
 
 	// Notify replicas of WAL changes.
 	// if changed {
@@ -590,36 +721,228 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	return nil
 }
 
-func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) error {
+func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) (origWALSize, newWALSize int64, synced bool, err error) {
+	// Capture WAL size before sync for checkpoint threshold checks.
+	origWALSize, err = db.walFileSize()
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("stat wal before sync: %w", err)
+	}
+
 	// Verify our last sync matches the current state of the WAL.
 	// This ensures that the last sync position of the real WAL hasn't
 	// been overwritten by another process.
 	info, err := db.verify(ctx)
 	if err != nil {
-		return fmt.Errorf("cannot verify wal state: %w", err)
+		return 0, 0, false, fmt.Errorf("cannot verify wal state: %w", err)
 	}
 
-	if err := db.sync(ctx, checkpointing, info); err != nil {
-		return fmt.Errorf("sync: %w", err)
+	synced, err = db.sync(ctx, checkpointing, info)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("sync: %w", err)
 	}
+
+	// Capture WAL size after sync for checkpoint threshold checks.
+	newWALSize, err = db.walFileSize()
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("stat wal after sync: %w", err)
+	}
+
+	return origWALSize, newWALSize, synced, nil
+}
+
+// checkpointIfNeeded performs a checkpoint based on configured thresholds.
+// Checks thresholds in priority order: TruncatePageN → MinCheckpointPageN → CheckpointInterval.
+//
+// TruncatePageN uses TRUNCATE mode (blocking), others use PASSIVE mode (non-blocking).
+//
+// Time-based checkpoints only trigger if db.syncedSinceCheckpoint is true, indicating
+// that data has been synced since the last checkpoint. This prevents creating unnecessary
+// LTX files when the only WAL data is from internal bookkeeping (like _litestream_seq
+// updates from previous checkpoints). See issue #896.
+func (db *DB) checkpointIfNeeded(ctx context.Context, origWALSize, newWALSize int64) error {
+	if db.pageSize == 0 {
+		return nil
+	}
+
+	// Priority 1: Emergency truncate checkpoint (TRUNCATE mode, blocking)
+	// This prevents unbounded WAL growth from long-lived read transactions.
+	if db.TruncatePageN > 0 && origWALSize >= calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)) {
+		db.Logger.Info("forcing truncate checkpoint",
+			"wal_size", origWALSize,
+			"threshold", calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)))
+		return db.checkpoint(ctx, CheckpointModeTruncate)
+	}
+
+	// Priority 2: Regular checkpoint at min threshold (PASSIVE mode, non-blocking)
+	if newWALSize >= calcWALSize(uint32(db.pageSize), uint32(db.MinCheckpointPageN)) {
+		if err := db.checkpoint(ctx, CheckpointModePassive); err != nil {
+			// PASSIVE checkpoints can fail with SQLITE_BUSY when database is locked.
+			// This is expected behavior and not an error - just log and continue.
+			if isSQLiteBusyError(err) {
+				db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
+
+	// Priority 3: Time-based checkpoint (PASSIVE mode, non-blocking)
+	// Only trigger if there have been actual changes synced since the last
+	// checkpoint. This prevents creating unnecessary LTX files when the only
+	// WAL data is from internal bookkeeping (like _litestream_seq updates).
+	if db.CheckpointInterval > 0 && db.syncedSinceCheckpoint {
+		// Get database file modification time
+		fi, err := db.f.Stat()
+		if err != nil {
+			return fmt.Errorf("stat database: %w", err)
+		}
+
+		// Only checkpoint if enough time has passed and WAL has data
+		if time.Since(fi.ModTime()) > db.CheckpointInterval && newWALSize > calcWALSize(uint32(db.pageSize), 1) {
+			if err := db.checkpoint(ctx, CheckpointModePassive); err != nil {
+				// PASSIVE checkpoints can fail with SQLITE_BUSY when database is locked.
+				// This is expected behavior and not an error - just log and continue.
+				if isSQLiteBusyError(err) {
+					db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
+					return nil
+				}
+				return err
+			}
+			return nil
+		}
+	}
+
 	return nil
 }
 
+// isSQLiteBusyError returns true if the error is an SQLITE_BUSY error.
+func isSQLiteBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for "database is locked" or "SQLITE_BUSY" in error message
+	errStr := err.Error()
+	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "SQLITE_BUSY")
+}
+
+// walFileSize returns the size of the WAL file in bytes.
+func (db *DB) walFileSize() (int64, error) {
+	fi, err := os.Stat(db.WALPath())
+	if os.IsNotExist(err) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+// calcWALSize returns the size of the WAL for a given page size & count.
+// Casts to int64 before multiplication to prevent uint32 overflow with large page sizes.
+func calcWALSize(pageSize uint32, pageN uint32) int64 {
+	return int64(WALHeaderSize) + (int64(WALFrameHeaderSize+pageSize) * int64(pageN))
+}
+
 // ensureWALExists checks that the real WAL exists and has a header.
-func (db *DB) ensureWALExists() (err error) {
+func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	// Exit early if WAL header exists.
 	if fi, err := os.Stat(db.WALPath()); err == nil && fi.Size() >= WALHeaderSize {
 		return nil
 	}
 
 	// Otherwise create transaction that updates the internal litestream table.
-	_, err = db.db.Exec(`INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`)
+	_, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`)
 	return err
+}
+
+// checkDatabaseBehindReplica detects when a database has been restored to an
+// earlier state and the replica has a higher TXID. This handles issue #781.
+//
+// If detected, it clears local L0 files and fetches the latest L0 LTX file
+// from the replica to establish a baseline. The next DB.sync() will detect
+// the mismatch and trigger a snapshot at the current database state.
+func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
+	// Get database position from local L0 files
+	dbPos, err := db.Pos()
+	if err != nil {
+		return fmt.Errorf("get database position: %w", err)
+	}
+
+	// Get replica position from remote
+	replicaInfo, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+	if err != nil {
+		return fmt.Errorf("get replica position: %w", err)
+	} else if replicaInfo.MaxTXID == 0 {
+		return nil // No remote replica data yet
+	}
+
+	// Check if database is behind replica
+	if dbPos.TXID >= replicaInfo.MaxTXID {
+		return nil // Database is ahead or equal
+	}
+
+	db.Logger.Info("detected database behind replica",
+		"db_txid", dbPos.TXID,
+		"replica_txid", replicaInfo.MaxTXID)
+
+	// Clear local L0 files
+	l0Dir := db.LTXLevelDir(0)
+	if err := os.RemoveAll(l0Dir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove L0 directory: %w", err)
+	}
+	if err := internal.MkdirAll(l0Dir, db.dirInfo); err != nil {
+		return fmt.Errorf("recreate L0 directory: %w", err)
+	}
+
+	// Fetch latest L0 LTX file from replica
+	minTXID, maxTXID := replicaInfo.MinTXID, replicaInfo.MaxTXID
+	reader, err := db.Replica.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID, 0, 0)
+	if err != nil {
+		return fmt.Errorf("open remote L0 file: %w", err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	// Write to temp file and atomically rename
+	localPath := db.LTXPath(0, minTXID, maxTXID)
+	tmpPath := localPath + ".tmp"
+
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create temp L0 file: %w", err)
+	}
+	defer func() { _ = os.Remove(tmpPath) }() // Clean up temp file on error
+
+	if _, err := io.Copy(tmpFile, reader); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("copy L0 file: %w", err)
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("sync L0 file: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close L0 file: %w", err)
+	}
+
+	// Atomically rename temp file to final path
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		return fmt.Errorf("rename L0 file: %w", err)
+	}
+
+	db.Logger.Info("fetched latest L0 file from replica",
+		"min_txid", minTXID,
+		"max_txid", maxTXID)
+
+	return nil
 }
 
 // verify ensures the current LTX state matches where it left off from
 // the real WAL. Check info.ok if verification was successful.
 func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
+	frameSize := int64(db.pageSize + WALFrameHeaderSize)
 	info.snapshotting = true
 
 	pos, err := db.Pos()
@@ -661,46 +984,68 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	}
 	salt1 := binary.BigEndian.Uint32(hdr0[16:])
 	salt2 := binary.BigEndian.Uint32(hdr0[20:])
+	saltMatch := salt1 == dec.Header().WALSalt1 && salt2 == dec.Header().WALSalt2
 
-	if salt1 != dec.Header().WALSalt1 || salt2 != dec.Header().WALSalt2 {
+	// Handle edge case where we're at WAL header (WALOffset=32, WALSize=0).
+	// This can happen when an LTX file represents a state at the beginning of the WAL
+	// with no frames written yet. We must check this before computing prevWALOffset
+	// to avoid underflow (32 - 4120 = -4088).
+	// See: https://github.com/benbjohnson/litestream/issues/900
+	if info.offset == WALHeaderSize {
+		slog.Debug("verify", "saltMatch", saltMatch, "atWALHeader", true)
+		if saltMatch {
+			info.snapshotting = false
+			return info, nil
+		}
+		info.reason = "wal header salt reset, snapshotting"
+		return info, nil
+	}
+
+	// If offset is at the beginning of the first page, we can't check for previous page.
+	prevWALOffset := info.offset - frameSize
+	slog.Debug("verify", "saltMatch", saltMatch, "prevWALOffset", prevWALOffset)
+
+	if prevWALOffset == WALHeaderSize {
+		if saltMatch { // No writes occurred since last sync, salt still matches
+			info.snapshotting = false
+			return info, nil
+		}
+		// Salt has changed but we don't know if writes occurred since last sync
+		info.reason = "wal header salt reset, snapshotting"
+		return info, nil
+	} else if prevWALOffset < WALHeaderSize {
+		return info, fmt.Errorf("prev WAL offset is less than the header size: %d", prevWALOffset)
+	}
+
+	// If we can't verify the last page is in the last LTX file, then we need to snapshot.
+	lastPageMatch, err := db.lastPageMatch(ctx, dec, prevWALOffset, frameSize)
+	if err != nil {
+		return info, fmt.Errorf("last page match: %w", err)
+	} else if !lastPageMatch {
+		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
+		return info, nil
+	}
+
+	slog.Debug("verify.2", "lastPageMatch", lastPageMatch)
+
+	// Salt has changed which could indicate a FULL checkpoint.
+	// If we have a last page match, then we can assume that the WAL has not been overwritten.
+	if !saltMatch {
 		db.Logger.Log(ctx, internal.LevelTrace, "wal restarted",
 			"salt1", salt1,
 			"salt2", salt2)
 
 		info.offset = WALHeaderSize
 		info.salt1, info.salt2 = salt1, salt2
-		info.snapshotting = false
-		return info, nil
-	}
 
-	// If offset is at the beginning of the first page, we can't check for previous page.
-	frameSize := int64(db.pageSize + WALFrameHeaderSize)
-	prevWALOffset := info.offset - frameSize
-	if prevWALOffset <= 0 {
-		info.snapshotting = false
-		return info, nil
-	}
+		if detected, err := db.detectFullCheckpoint(ctx, [][2]uint32{{salt1, salt2}, {dec.Header().WALSalt1, dec.Header().WALSalt2}}); err != nil {
+			return info, fmt.Errorf("detect full checkpoint: %w", err)
+		} else if detected {
+			info.reason = "full or restart checkpoint detected, snapshotting"
+		} else {
+			info.snapshotting = false
+		}
 
-	// Verify last page exists in latest LTX file.
-	buf, err := readWALFileAt(db.WALPath(), prevWALOffset, frameSize)
-	if err != nil {
-		return info, fmt.Errorf("cannot read last synced wal page: %w", err)
-	}
-	pgno := binary.BigEndian.Uint32(buf[0:])
-	fsalt1 := binary.BigEndian.Uint32(buf[8:])
-	fsalt2 := binary.BigEndian.Uint32(buf[12:])
-
-	if fsalt1 != dec.Header().WALSalt1 || fsalt2 != dec.Header().WALSalt2 {
-		info.reason = "frame salt mismatch, wal overwritten by another process"
-		return info, nil
-	}
-
-	// Verify that the last page in the WAL exists in the last LTX file.
-	if ok, err := db.ltxDecoderContains(dec, pgno, buf[WALFrameHeaderSize:]); err != nil {
-		return info, fmt.Errorf("ltx contains: %w", err)
-	} else if !ok {
-		db.Logger.Log(ctx, internal.LevelTrace, "cannot find last page in last ltx file", "pgno", pgno, "offset", prevWALOffset)
-		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
 		return info, nil
 	}
 
@@ -709,24 +1054,75 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	return info, nil
 }
 
-func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bool, error) {
+// lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
+func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset, frameSize int64) (bool, error) {
+	if prevWALOffset <= WALHeaderSize {
+		return false, nil
+	}
+
+	frame, err := readWALFileAt(db.WALPath(), prevWALOffset, frameSize)
+	if err != nil {
+		return false, fmt.Errorf("cannot read last synced wal page: %w", err)
+	}
+	pgno := binary.BigEndian.Uint32(frame[0:])
+	fsalt1 := binary.BigEndian.Uint32(frame[8:])
+	fsalt2 := binary.BigEndian.Uint32(frame[12:])
+	data := frame[WALFrameHeaderSize:]
+
+	if fsalt1 != dec.Header().WALSalt1 || fsalt2 != dec.Header().WALSalt2 {
+		return false, nil
+	}
+
+	// Verify that the last page in the WAL exists in the last LTX file.
 	buf := make([]byte, dec.Header().PageSize)
 	for {
 		var hdr ltx.PageHeader
-		if err := dec.DecodePage(&hdr, buf); err == io.EOF {
-			return false, nil
+		if err := dec.DecodePage(&hdr, buf); errors.Is(err, io.EOF) {
+			return false, nil // page not found in LTX file
 		} else if err != nil {
 			return false, fmt.Errorf("decode ltx page: %w", err)
 		}
 
 		if pgno != hdr.Pgno {
-			continue
+			continue // page number doesn't match
 		}
 		if !bytes.Equal(data, buf) {
-			continue
+			continue // page data doesn't match
 		}
-		return true, nil
+		return true, nil // Page matches
 	}
+}
+
+// detectFullCheckpoint attempts to detect checks if a FULL or RESTART checkpoint
+// has occurred and we may have missed some frames.
+func (db *DB) detectFullCheckpoint(ctx context.Context, knownSalts [][2]uint32) (bool, error) {
+	walFile, err := os.Open(db.WALPath())
+	if err != nil {
+		return false, fmt.Errorf("open wal file: %w", err)
+	}
+	defer walFile.Close()
+
+	var lastKnownSalt [2]uint32
+	if len(knownSalts) > 0 {
+		lastKnownSalt = knownSalts[len(knownSalts)-1]
+	}
+
+	rd, err := NewWALReader(walFile, db.Logger)
+	if err != nil {
+		return false, fmt.Errorf("new wal reader: %w", err)
+	}
+	m, err := rd.FrameSaltsUntil(ctx, lastKnownSalt)
+	if err != nil {
+		return false, fmt.Errorf("frame salts until: %w", err)
+	}
+
+	// Remove known salts from the map.
+	for _, salt := range knownSalts {
+		delete(m, salt)
+	}
+
+	// If we have more than one unknown salt, then we have a FULL or RESTART checkpoint.
+	return len(m) >= 1, nil
 }
 
 type syncInfo struct {
@@ -738,11 +1134,12 @@ type syncInfo struct {
 }
 
 // sync copies pending bytes from the real WAL to LTX.
-func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error {
+// Returns synced=true if an LTX file was created (i.e., there were new pages to sync).
+func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (synced bool, err error) {
 	// Determine the next sequential transaction ID.
 	pos, err := db.Pos()
 	if err != nil {
-		return fmt.Errorf("pos: %w", err)
+		return false, fmt.Errorf("pos: %w", err)
 	}
 	txID := pos.TXID + 1
 
@@ -771,40 +1168,40 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 
 	fi, err := db.f.Stat()
 	if err != nil {
-		return err
+		return false, err
 	}
 	mode := fi.Mode()
 	commit := uint32(fi.Size() / int64(db.pageSize))
 
 	walFile, err := os.Open(db.WALPath())
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer walFile.Close()
 
 	var rd *WALReader
 	if info.offset == WALHeaderSize {
 		if rd, err = NewWALReader(walFile, db.Logger); err != nil {
-			return fmt.Errorf("new wal reader: %w", err)
+			return false, fmt.Errorf("new wal reader: %w", err)
 		}
 	} else {
 		// If we cannot verify the previous frame
 		var pfmError *PrevFrameMismatchError
-		if rd, err = NewWALReaderWithOffset(walFile, info.offset, info.salt1, info.salt2, db.Logger); errors.As(err, &pfmError) {
+		if rd, err = NewWALReaderWithOffset(ctx, walFile, info.offset, info.salt1, info.salt2, db.Logger); errors.As(err, &pfmError) {
 			db.Logger.Log(ctx, internal.LevelTrace, "prev frame mismatch, snapshotting", "err", pfmError.Err)
 			info.offset = WALHeaderSize
 			if rd, err = NewWALReader(walFile, db.Logger); err != nil {
-				return fmt.Errorf("new wal reader, after reset")
+				return false, fmt.Errorf("new wal reader, after reset")
 			}
 		} else if err != nil {
-			return fmt.Errorf("new wal reader with offset: %w", err)
+			return false, fmt.Errorf("new wal reader with offset: %w", err)
 		}
 	}
 
 	// Build a mapping of changed page numbers and their latest content.
 	pageMap, maxOffset, walCommit, err := rd.PageMap(ctx)
 	if err != nil {
-		return fmt.Errorf("page map: %w", err)
+		return false, fmt.Errorf("page map: %w", err)
 	}
 	if walCommit > 0 {
 		commit = walCommit
@@ -816,20 +1213,25 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	}
 	assert(sz >= 0, fmt.Sprintf("wal size must be positive: sz=%d, maxOffset=%d, info.offset=%d", sz, maxOffset, info.offset))
 
+	// Track total WAL bytes synced.
+	if sz > 0 {
+		db.totalWALBytesCounter.Add(float64(sz))
+	}
+
 	// Exit if we have no new WAL pages and we aren't snapshotting.
 	if !info.snapshotting && sz == 0 {
 		db.Logger.Log(ctx, internal.LevelTrace, "sync: skip", "reason", "no new wal pages")
-		return nil
+		return false, nil
 	}
 
 	tmpFilename := filename + ".tmp"
 	if err := internal.MkdirAll(filepath.Dir(tmpFilename), db.dirInfo); err != nil {
-		return err
+		return false, err
 	}
 
 	ltxFile, err := os.OpenFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
-		return fmt.Errorf("open temp ltx file: %w", err)
+		return false, fmt.Errorf("open temp ltx file: %w", err)
 	}
 	defer func() { _ = os.Remove(tmpFilename) }()
 	defer func() { _ = ltxFile.Close() }()
@@ -846,10 +1248,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 		"salt2", rd.salt2)
 
 	timestamp := time.Now()
-	enc := ltx.NewEncoder(ltxFile)
+	enc, err := ltx.NewEncoder(ltxFile)
+	if err != nil {
+		return false, fmt.Errorf("new ltx encoder: %w", err)
+	}
 	if err := enc.EncodeHeader(ltx.Header{
 		Version:   ltx.Version,
-		Flags:     ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4,
+		Flags:     ltx.HeaderFlagNoChecksum,
 		PageSize:  uint32(db.pageSize),
 		Commit:    commit,
 		MinTXID:   txID,
@@ -860,41 +1265,44 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 		WALSalt1:  rd.salt1,
 		WALSalt2:  rd.salt2,
 	}); err != nil {
-		return fmt.Errorf("encode ltx header: %w", err)
+		return false, fmt.Errorf("encode ltx header: %w", err)
 	}
 
 	// If we need a full snapshot, then copy from the database & WAL.
 	// Otherwise, just copy incrementally from the WAL.
 	if info.snapshotting {
 		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
-			return fmt.Errorf("write ltx from db: %w", err)
+			return false, fmt.Errorf("write ltx from db: %w", err)
 		}
 	} else {
 		if err := db.writeLTXFromWAL(ctx, enc, walFile, pageMap); err != nil {
-			return fmt.Errorf("write ltx from db: %w", err)
+			return false, fmt.Errorf("write ltx from wal: %w", err)
 		}
 	}
 
 	// Encode final trailer to the end of the LTX file.
 	if err := enc.Close(); err != nil {
-		return fmt.Errorf("close ltx encoder: %w", err)
+		return false, fmt.Errorf("close ltx encoder: %w", err)
 	}
 
 	// Sync & close LTX file.
 	if err := ltxFile.Sync(); err != nil {
-		return fmt.Errorf("sync ltx file: %w", err)
+		return false, fmt.Errorf("sync ltx file: %w", err)
 	}
 	if err := ltxFile.Close(); err != nil {
-		return fmt.Errorf("close ltx file: %w", err)
+		return false, fmt.Errorf("close ltx file: %w", err)
 	}
 
 	// Atomically rename file to final path.
 	if err := os.Rename(tmpFilename, filename); err != nil {
+		db.maxLTXFileInfos.Lock()
 		delete(db.maxLTXFileInfos.m, 0) // clear cache if in unknown state
-		return fmt.Errorf("rename ltx file: %w", err)
+		db.maxLTXFileInfos.Unlock()
+		return false, fmt.Errorf("rename ltx file: %w", err)
 	}
 
 	// Update file info cache for L0.
+	db.maxLTXFileInfos.Lock()
 	db.maxLTXFileInfos.m[0] = &ltx.FileInfo{
 		Level:     0,
 		MinTXID:   txID,
@@ -902,10 +1310,11 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 		CreatedAt: time.Now(),
 		Size:      enc.N(),
 	}
+	db.maxLTXFileInfos.Unlock()
 
 	db.Logger.Debug("db sync", "status", "ok")
 
-	return nil
+	return true, nil
 }
 
 func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
@@ -1007,15 +1416,15 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	}
 
 	// Copy end of WAL before checkpoint to copy as much as possible.
-	if err := db.verifyAndSync(ctx, true); err != nil {
+	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
 		return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
 	}
 
 	// Execute checkpoint and immediately issue a write to the WAL to ensure
 	// a new page is written.
-	if err := db.execCheckpoint(mode); err != nil {
+	if err := db.execCheckpoint(ctx, mode); err != nil {
 		return err
-	} else if _, err = db.db.Exec(`INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
+	} else if _, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
 		return err
 	}
 
@@ -1023,11 +1432,12 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	if other, err := readWALHeader(db.WALPath()); err != nil {
 		return err
 	} else if bytes.Equal(hdr, other) {
+		db.syncedSinceCheckpoint = false
 		return nil
 	}
 
 	// Start a transaction. This will be promoted immediately after.
-	tx, err := db.db.Begin()
+	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
 	}
@@ -1042,7 +1452,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	}
 
 	// Copy anything that may have occurred after the checkpoint.
-	if err := db.verifyAndSync(ctx, true); err != nil {
+	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
 		return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
 	}
 
@@ -1050,10 +1460,12 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	if err := tx.Rollback(); err != nil {
 		return fmt.Errorf("rollback post-checkpoint tx: %w", err)
 	}
+
+	db.syncedSinceCheckpoint = false
 	return nil
 }
 
-func (db *DB) execCheckpoint(mode string) (err error) {
+func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// Ignore if there is no underlying database.
 	if db.db == nil {
 		return nil
@@ -1075,7 +1487,7 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 	if err := db.releaseReadLock(); err != nil {
 		return fmt.Errorf("release read lock: %w", err)
 	}
-	defer func() { _ = db.acquireReadLock() }()
+	defer func() { _ = db.acquireReadLock(ctx) }()
 
 	// A non-forced checkpoint is issued as "PASSIVE". This will only checkpoint
 	// if there are not pending transactions. A forced checkpoint ("RESTART")
@@ -1086,14 +1498,14 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 	rawsql := `PRAGMA wal_checkpoint(` + mode + `);`
 
 	var row [3]int
-	if err := db.db.QueryRow(rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
+	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
 		return err
 	}
 	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", row[0], row[1], row[2]))
 
 	// Reacquire the read lock immediately after the checkpoint.
-	if err := db.acquireReadLock(); err != nil {
-		return fmt.Errorf("release read lock: %w", err)
+	if err := db.acquireReadLock(ctx); err != nil {
+		return fmt.Errorf("reacquire read lock: %w", err)
 	}
 
 	return nil
@@ -1101,7 +1513,7 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
-	if db.pageSize == 0 {
+	if db.PageSize() == 0 {
 		return ltx.Pos{}, nil, fmt.Errorf("page size not initialized yet")
 	}
 
@@ -1163,10 +1575,14 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 			"salt1", rd.salt1,
 			"salt2", rd.salt2)
 
-		enc := ltx.NewEncoder(pw)
+		enc, err := ltx.NewEncoder(pw)
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
+			return
+		}
 		if err := enc.EncodeHeader(ltx.Header{
 			Version:   ltx.Version,
-			Flags:     ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4,
+			Flags:     ltx.HeaderFlagNoChecksum,
 			PageSize:  uint32(db.pageSize),
 			Commit:    commit,
 			MinTXID:   1,
@@ -1209,7 +1625,8 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	seekTXID := prevMaxInfo.MaxTXID + 1
 
 	// Collect files after last compaction.
-	itr, err := db.Replica.Client.LTXFiles(ctx, srcLevel, seekTXID)
+	// Normal operation - use fast timestamps
+	itr, err := db.Replica.Client.LTXFiles(ctx, srcLevel, seekTXID, false)
 	if err != nil {
 		return nil, fmt.Errorf("source ltx files after %s: %w", seekTXID, err)
 	}
@@ -1219,7 +1636,9 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	var rdrs []io.Reader
 	defer func() {
 		for _, rd := range rdrs {
-			_ = rd.(io.Closer).Close()
+			if closer, ok := rd.(io.Closer); ok {
+				_ = closer.Close()
+			}
 		}
 	}()
 
@@ -1236,7 +1655,18 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 			maxTXID = info.MaxTXID
 		}
 
-		f, err := db.Replica.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID)
+		// Prefer the on-disk LTX file when available so compaction is not subject
+		// to eventual consistency quirks of remote storage providers. Fallback to
+		// downloading the file from the replica client if the local copy has been
+		// removed.
+		if f, err := os.Open(db.LTXPath(srcLevel, info.MinTXID, info.MaxTXID)); err == nil {
+			rdrs = append(rdrs, f)
+			continue
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("open local ltx file: %w", err)
+		}
+
+		f, err := db.Replica.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 		if err != nil {
 			return nil, fmt.Errorf("open ltx file: %w", err)
 		}
@@ -1249,8 +1679,12 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	// Stream compaction to destination in level.
 	pr, pw := io.Pipe()
 	go func() {
-		c := ltx.NewCompactor(pw, rdrs)
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4
+		c, err := ltx.NewCompactor(pw, rdrs)
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			return
+		}
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
@@ -1264,10 +1698,13 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	db.maxLTXFileInfos.m[dstLevel] = info
 	db.maxLTXFileInfos.Unlock()
 
-	// If this is L1, clean up L0 files that are below the minTXID.
+	// If this is L1, clean up L0 files using the time-based retention policy.
 	if dstLevel == 1 {
-		if err := db.EnforceRetentionByTXID(ctx, 0, maxTXID); err != nil {
-			db.Logger.Error("enforce L0 retention", "error", err)
+		if err := db.EnforceL0RetentionByTime(ctx); err != nil {
+			// Don't log context cancellation errors during shutdown
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				db.Logger.Error("enforce L0 time retention", "error", err)
+			}
 		}
 	}
 
@@ -1296,7 +1733,8 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time) (minSnapshotTXID ltx.TXID, err error) {
 	db.Logger.Debug("enforcing snapshot retention", "timestamp", timestamp)
 
-	itr, err := db.Replica.Client.LTXFiles(ctx, SnapshotLevel, 0)
+	// Normal operation - use fast timestamps
+	itr, err := db.Replica.Client.LTXFiles(ctx, SnapshotLevel, 0, false)
 	if err != nil {
 		return 0, fmt.Errorf("fetch ltx files: %w", err)
 	}
@@ -1326,15 +1764,110 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	// Remove all files marked for deletion.
-	for _, info := range deleted {
-		db.Logger.Info("deleting ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
-	}
+	// Remove all files marked for deletion from both remote and local storage.
 	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
+	for _, info := range deleted {
+		localPath := db.LTXPath(SnapshotLevel, info.MinTXID, info.MaxTXID)
+		db.Logger.Debug("deleting local ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
+		}
+	}
+
 	return minSnapshotTXID, nil
+}
+
+// EnforceL0RetentionByTime retains L0 files until they have been compacted into
+// L1 and have existed for at least L0Retention.
+func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
+	if db.L0Retention <= 0 {
+		return nil
+	}
+
+	db.Logger.Debug("enforcing l0 retention", "retention", db.L0Retention)
+
+	// Determine the highest TXID that has been compacted into L1.
+	itr, err := db.Replica.Client.LTXFiles(ctx, 1, 0, false)
+	if err != nil {
+		return fmt.Errorf("fetch l1 files: %w", err)
+	}
+	var maxL1TXID ltx.TXID
+	for itr.Next() {
+		info := itr.Item()
+		if info.MaxTXID > maxL1TXID {
+			maxL1TXID = info.MaxTXID
+		}
+	}
+	if err := itr.Close(); err != nil {
+		return fmt.Errorf("close l1 iterator: %w", err)
+	}
+	if maxL1TXID == 0 {
+		return nil
+	}
+
+	threshold := time.Now().Add(-db.L0Retention)
+	itr, err = db.Replica.Client.LTXFiles(ctx, 0, 0, false)
+	if err != nil {
+		return fmt.Errorf("fetch l0 files: %w", err)
+	}
+	defer itr.Close()
+
+	var (
+		deleted      []*ltx.FileInfo
+		lastInfo     *ltx.FileInfo
+		processedAll = true
+	)
+	for itr.Next() {
+		info := itr.Item()
+		lastInfo = info
+
+		createdAt := info.CreatedAt
+		if createdAt.IsZero() {
+			if fi, err := os.Stat(db.LTXPath(0, info.MinTXID, info.MaxTXID)); err == nil {
+				createdAt = fi.ModTime().UTC()
+			} else {
+				createdAt = threshold
+			}
+		}
+
+		if createdAt.After(threshold) {
+			// L0 entries are ordered; once we reach a newer file we stop so we don't
+			// create gaps between retained files. VFS expects contiguous coverage.
+			processedAll = false
+			break
+		}
+
+		if info.MaxTXID <= maxL1TXID {
+			deleted = append(deleted, info)
+		}
+	}
+
+	// Ensure we do not delete the newest L0 file only if we processed the entire level.
+	if processedAll && len(deleted) > 0 && lastInfo != nil && deleted[len(deleted)-1] == lastInfo {
+		deleted = deleted[:len(deleted)-1]
+	}
+
+	if len(deleted) == 0 {
+		return nil
+	}
+
+	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+		return fmt.Errorf("remove expired l0 files: %w", err)
+	}
+
+	for _, info := range deleted {
+		localPath := db.LTXPath(0, info.MinTXID, info.MaxTXID)
+		db.Logger.Debug("deleting expired local l0 file", "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			db.Logger.Error("failed to remove local l0 file", "path", localPath, "error", err)
+		}
+	}
+
+	return nil
 }
 
 // EnforceRetentionByTXID enforces retention so that any LTX files below
@@ -1342,7 +1875,8 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TXID) (err error) {
 	db.Logger.Debug("enforcing retention", "level", level, "txid", txID)
 
-	itr, err := db.Replica.Client.LTXFiles(ctx, level, 0)
+	// Normal operation - use fast timestamps
+	itr, err := db.Replica.Client.LTXFiles(ctx, level, 0, false)
 	if err != nil {
 		return fmt.Errorf("fetch ltx files: %w", err)
 	}
@@ -1366,12 +1900,18 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	// Remove all files marked for deletion.
-	for _, info := range deleted {
-		db.Logger.Info("deleting ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
-	}
+	// Remove all files marked for deletion from both remote and local storage.
 	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove ltx files: %w", err)
+	}
+
+	for _, info := range deleted {
+		localPath := db.LTXPath(level, info.MinTXID, info.MaxTXID)
+		db.Logger.Debug("deleting local ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
+		}
 	}
 
 	return nil
@@ -1408,7 +1948,7 @@ func (db *DB) CRC64(ctx context.Context) (uint64, ltx.Pos, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := db.init(); err != nil {
+	if err := db.init(ctx); err != nil {
 		return 0, ltx.Pos{}, err
 	} else if db.db == nil {
 		return 0, ltx.Pos{}, os.ErrNotExist

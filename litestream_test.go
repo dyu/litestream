@@ -5,8 +5,8 @@ import (
 	"encoding/hex"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/superfly/ltx"
+	_ "modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream"
 )
@@ -54,6 +54,7 @@ func TestLTXLevelDir(t *testing.T) {
 }
 
 func LTXFilePath(t *testing.T) {
+	t.Helper()
 	if got, want := litestream.LTXFilePath("foo", 0, ltx.TXID(100), ltx.TXID(200)), "-"; got != want {
 		t.Fatalf("LTXPath()=%v, want %v", got, want)
 	}

@@ -3,7 +3,6 @@ Litestream
 ![Status](https://img.shields.io/badge/status-beta-blue)
 ![GitHub](https://img.shields.io/github/license/benbjohnson/litestream)
 [![Docker Pulls](https://img.shields.io/docker/pulls/litestream/litestream.svg?maxAge=604800)](https://hub.docker.com/r/litestream/litestream/)
-![test](https://github.com/benbjohnson/litestream/workflows/test/badge.svg)
 ==========
 
 Litestream is a standalone disaster recovery tool for SQLite. It runs as a
@@ -21,14 +20,15 @@ GitHub.
 
 [slack]: https://join.slack.com/t/litestream/shared_invite/zt-n0j4s3ci-lx1JziR3bV6L2NMF723H3Q
 
+Contributing
+------------
 
-## Acknowledgements
+We welcome bug reports, fixes, and patches! Please see our [Contributing Guide](CONTRIBUTING.md) for details on how to contribute.
 
-While the Litestream project does not accept external code patches, many
-of the most valuable contributions are in the forms of testing, feedback, and
-documentation. These help harden software and streamline usage for other users.
+Acknowledgements
+----------------
 
-I want to give special thanks to individuals who invest much of their time and 
+I want to give special thanks to individuals who invest much of their time and
 energy into the project to help make it better:
 
 - Thanks to [Cory LaNou](https://twitter.com/corylanou) for giving early feedback and testing when Litestream was still pre-release.
@@ -39,22 +39,3 @@ energy into the project to help make it better:
 - Thanks to [Simon Gottschlag](https://github.com/simongottschlag), [Marin](https://github.com/supermarin),[Victor Björklund](https://github.com/victorbjorklund), [Jonathan Beri](https://twitter.com/beriberikix) [Yuri](https://github.com/yurivish), [Nathan Probst](https://github.com/nprbst), [Yann Coleu](https://github.com/yanc0), and [Nicholas Grilly](https://twitter.com/ngrilly) for frequent feedback, testing, & support.
 
 Huge thanks to fly.io for their support and for contributing credits for testing and development!
-
-
-## Contribution Policy
-
-Initially, Litestream was closed to outside contributions. The goal was to
-reduce burnout by limiting the maintenance overhead of reviewing and validating
-third-party code. However, this policy is overly broad and has prevented small,
-easily testable patches from being contributed.
-
-Litestream is now open to code contributions for bug fixes only. Features carry
-a long-term maintenance burden so they will not be accepted at this time.
-Please [submit an issue][new-issue] if you have a feature you'd like to
-request.
-
-If you find mistakes in the documentation, please submit a fix to the
-[documentation repository][docs].
-
-[new-issue]: https://github.com/benbjohnson/litestream/issues/new
-[docs]: https://github.com/benbjohnson/litestream.io

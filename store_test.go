@@ -1,23 +1,27 @@
 package litestream_test
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
 func TestStore_CompactDB(t *testing.T) {
 	t.Run("L1", func(t *testing.T) {
-		db0, sqldb0 := MustOpenDBs(t)
-		defer MustCloseDBs(t, db0, sqldb0)
+		db0, sqldb0 := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db0, sqldb0)
 
-		db1, sqldb1 := MustOpenDBs(t)
-		defer MustCloseDBs(t, db1, sqldb1)
+		db1, sqldb1 := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db1, sqldb1)
 
 		levels := litestream.CompactionLevels{
 			{Level: 0},
@@ -29,38 +33,41 @@ func TestStore_CompactDB(t *testing.T) {
 		if err := s.Open(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		defer s.Close()
+		defer s.Close(t.Context())
 
-		if _, err := sqldb0.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := sqldb0.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Sync(context.Background()); err != nil {
+		} else if err := db0.Sync(t.Context()); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Replica.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		if _, err := s.CompactDB(t.Context(), db0, levels[1]); err != nil {
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
-		// Re-compacting immediately should return an error that it's too soon.
-		if _, err := s.CompactDB(t.Context(), db0, levels[1]); err != litestream.ErrCompactionTooEarly {
-			t.Fatalf("unexpected error: %s", err)
-		}
+		_, err := s.CompactDB(t.Context(), db0, levels[1])
+		require.NoError(t, err)
+
+		// Re-compacting immediately should return an error indicating compaction
+		// cannot proceed. This may be ErrCompactionTooEarly (detected timing conflict)
+		// or ErrNoCompaction (no new files to compact). Both are valid outcomes
+		// depending on whether we crossed a second boundary during the first compaction
+		// (PrevCompactionAt truncates to seconds, causing edge cases at boundaries).
+		_, err = s.CompactDB(t.Context(), db0, levels[1])
+		require.True(t,
+			errors.Is(err, litestream.ErrCompactionTooEarly) || errors.Is(err, litestream.ErrNoCompaction),
+			"expected ErrCompactionTooEarly or ErrNoCompaction, got: %v", err)
 
 		// Re-compacting after the interval should show that there is nothing to compact.
 		time.Sleep(levels[1].Interval)
-		if _, err := s.CompactDB(t.Context(), db0, levels[1]); err != litestream.ErrNoCompaction {
-			t.Fatalf("unexpected error: %s", err)
-		}
+		_, err = s.CompactDB(t.Context(), db0, levels[1])
+		require.ErrorIs(t, err, litestream.ErrNoCompaction)
 	})
 
 	t.Run("Snapshot", func(t *testing.T) {
-		db0, sqldb0 := MustOpenDBs(t)
-		defer MustCloseDBs(t, db0, sqldb0)
+		db0, sqldb0 := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db0, sqldb0)
 
 		levels := litestream.CompactionLevels{
 			{Level: 0},
@@ -72,16 +79,16 @@ func TestStore_CompactDB(t *testing.T) {
 		if err := s.Open(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		defer s.Close()
+		defer s.Close(t.Context())
 
-		if _, err := sqldb0.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := sqldb0.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Sync(context.Background()); err != nil {
+		} else if err := db0.Sync(t.Context()); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Replica.Sync(context.Background()); err != nil {
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -90,8 +97,33 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 
 		// Re-compacting immediately should return an error that there's nothing to compact.
-		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); err != litestream.ErrCompactionTooEarly {
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrCompactionTooEarly) {
 			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	// Regression test for GitHub issue #877: level 9 compaction fails with
+	// "page size not initialized yet" error when attempted before DB initialization.
+	t.Run("DBNotReady", func(t *testing.T) {
+		db0 := testingutil.MustOpenDB(t)
+		defer testingutil.MustCloseDB(t, db0)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: 100 * time.Millisecond},
+		}
+		s := litestream.NewStore([]*litestream.DB{db0}, levels)
+		s.CompactionMonitorEnabled = false
+		if err := s.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(t.Context())
+
+		// Attempt snapshot before DB is initialized (page size not set).
+		// This reproduces the timing issue where level 9 compaction fires
+		// immediately at startup before db.Sync() has been called.
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrDBNotReady) {
+			t.Fatalf("expected ErrDBNotReady, got: %v", err)
 		}
 	})
 }
@@ -103,15 +135,15 @@ func TestStore_Integration(t *testing.T) {
 
 	const factor = 1
 
-	db := newDB(t, filepath.Join(t.TempDir(), "db"))
+	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
 	db.MonitorInterval = factor * 100 * time.Millisecond
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = file.NewReplicaClient(t.TempDir())
 	if err := db.Open(); err != nil {
 		t.Fatal(err)
 	}
-	sqldb := MustOpenSQLDB(t, db.Path())
-	defer MustCloseSQLDB(t, sqldb)
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseSQLDB(t, sqldb)
 
 	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
 		{Level: 0},
@@ -122,10 +154,10 @@ func TestStore_Integration(t *testing.T) {
 	if err := store.Open(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer store.Close(t.Context())
 
 	// Create initial table
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -133,8 +165,28 @@ func TestStore_Integration(t *testing.T) {
 	done := make(chan struct{})
 	time.AfterFunc(10*time.Second, func() { close(done) })
 
+	// Channel for insert errors
+	insertErr := make(chan error, 1)
+
+	// WaitGroup to ensure insert goroutine completes before cleanup
+	var wg sync.WaitGroup
+
+	// Wait for insert goroutine to finish before cleanup & surface any errors.
+	defer func() {
+		wg.Wait()
+
+		select {
+		case err := <-insertErr:
+			t.Fatalf("insert error during test: %v", err)
+		default:
+			// No insert errors
+		}
+	}()
+
 	// Start goroutine to continuously insert records
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		ticker := time.NewTicker(factor * 10 * time.Millisecond)
 		defer ticker.Stop()
 
@@ -146,8 +198,19 @@ func TestStore_Integration(t *testing.T) {
 				return
 			case <-ticker.C:
 				if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (val) VALUES (?);`, time.Now().String()); err != nil {
-					t.Errorf("insert error: %v", err)
-					return
+					// Check if we're shutting down
+					select {
+					case <-done:
+						// Expected during shutdown, just exit
+						return
+					default:
+						// Real error, send it
+						select {
+						case insertErr <- err:
+						default:
+						}
+						return
+					}
 				}
 			}
 		}
@@ -173,8 +236,8 @@ func TestStore_Integration(t *testing.T) {
 			}
 
 			func() {
-				restoreDB := MustOpenSQLDB(t, outputPath)
-				defer MustCloseSQLDB(t, restoreDB)
+				restoreDB := testingutil.MustOpenSQLDB(t, outputPath)
+				defer testingutil.MustCloseSQLDB(t, restoreDB)
 
 				var result string
 				if err := restoreDB.QueryRowContext(t.Context(), `PRAGMA integrity_check;`).Scan(&result); err != nil {
@@ -192,5 +255,24 @@ func TestStore_Integration(t *testing.T) {
 				t.Logf("restored database: %d records", count)
 			}()
 		}
+	}
+}
+
+// TestStore_SnapshotInterval_Default ensures that the default snapshot interval
+// is preserved when not explicitly set (regression test for issue #689).
+func TestStore_SnapshotInterval_Default(t *testing.T) {
+	// Create a store with no databases and no levels
+	store := litestream.NewStore(nil, nil)
+
+	// Verify default snapshot interval is set
+	if store.SnapshotInterval != litestream.DefaultSnapshotInterval {
+		t.Errorf("expected default snapshot interval of %v, got %v",
+			litestream.DefaultSnapshotInterval, store.SnapshotInterval)
+	}
+
+	// Verify default is 24 hours
+	if store.SnapshotInterval != 24*time.Hour {
+		t.Errorf("expected default snapshot interval of 24h, got %v",
+			store.SnapshotInterval)
 	}
 }
